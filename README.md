@@ -1,38 +1,47 @@
-# Python Project Management Backend
+# Python 项目管理系统 · Backend
 
-Python Project Management Backend 是个人服务器 Python 项目管理平台的后端服务，基于 FastAPI、SQLAlchemy、Pydantic 和 MySQL 构建。
+Python 项目管理系统后端是一个基于 FastAPI 的项目管理与自动化运维 API 服务。它负责连接数据库、管理用户权限、维护服务器资源、执行远程命令，并为前端提供项目创建、配置、启动、停止、检测、日志和删除等能力。
 
-该平台适用于个人 Python 开发者和 Python 团队，用于分布式管理自己的服务器和 Python 项目，属于自动化运维工具。它把项目创建、Conda 环境、数据库、Nginx 配置、项目启动停止、状态检测和操作日志整合到一套后端 API 中。
+系统面向个人 Python 开发者和 Python 团队，适用于集中管理多台服务器上的 Python 项目。它不是简单的项目 CRUD，而是围绕真实服务器操作构建：创建目录、创建 Conda 环境、检查 MySQL、写入 Nginx 配置、启动服务、停止服务、记录操作日志。
 
-## 项目状态
+## 功能截图
 
-基础功能已经完成，可以直接使用：
+### 新建项目流程
 
-- 新建项目
-- 服务状态
-- 检测状态
-- 前台启动
-- 后台启动
-- 部署启动
-- 停止服务
-- 设置
-- 详情
-- 日志
-- 删除
+后端会根据前端提交的服务器、项目名称、Python 版本、项目路径、Conda 环境、数据库和 Nginx 配置执行实际创建流程。创建动作按强一致性设计，目录、环境、数据库和 Nginx 配置需要按整体结果处理。
 
-工具开发和缺陷仍在持续修正和补充中。
+![新建项目](docs/images/create-project.png)
 
-## 主要功能
+### 设置工作流
 
-- 用户、角色和权限管理。
-- 服务器管理与用户服务器分配。
-- 项目目录创建与安全删除。
-- Conda 环境创建、检查和删除。
-- MySQL 数据库连接检查、创建和删除。
-- Nginx 服务检测、配置文件解析、server block 写入和删除。
-- 项目前台启动、后台启动、部署启动和安全停止。
-- 项目详情、项目操作日志、健康检测和运行端口检测。
-- 终端会话、命令执行、自动补全和历史滚动支持。
+设置接口支持按差异执行实际变更。例如只改数据库就只处理数据库，只改 Nginx 就只处理 Nginx；没有变化的配置不会重复操作。
+
+![数据库配置步骤](docs/images/setting-database.png)
+
+### 项目详情
+
+详情接口会汇总项目基础信息、项目路径、Conda 环境、Python 版本、数据库、Nginx、启动命令、运行状态等信息，供前端侧边栏展示。
+
+![项目详情](docs/images/project-detail.png)
+
+### 操作日志
+
+后端会记录项目创建和设置变更的配置快照、字段变化和执行动作，前端以时间线形式展示。
+
+![项目操作日志](docs/images/project-log.png)
+
+## 核心能力
+
+- 用户、角色、权限管理：支持 root 和普通用户权限隔离。
+- 服务器管理：支持服务器创建、删除、用户分配和可用性验证。
+- 项目创建：支持创建项目目录、Conda 环境、数据库和 Nginx 配置。
+- Conda 环境：支持创建、查询、切换和按删除范围移除。
+- 数据库配置：支持连接检测、数据库存在性判断、数据库创建和删除。
+- Nginx 配置：支持检测 Nginx 服务、解析配置文件、写入 server block、删除配置块和重新加载。
+- 项目运行：支持前台启动、后台启动、部署启动和停止服务。
+- 状态检测：支持服务运行状态、运行端口和项目健康状态检查。
+- 操作日志：记录创建、设置、删除等关键操作，保留配置变更上下文。
+- 终端能力：支持会话、命令执行、路径补全、命令补全、清屏和输出历史。
 
 ## 技术栈
 
@@ -41,34 +50,24 @@ Python Project Management Backend 是个人服务器 Python 项目管理平台�
 - SQLAlchemy 2.x
 - Pydantic 2.x
 - MySQL / aiomysql
-- Redis，可选
+- Redis
 - Uvicorn
+- PyMySQL
 
-## 环境要求
+## 项目结构
 
-业务服务器需要根据实际功能安装：
-
-- Python / Conda 或 Miniforge
-- MySQL，如需数据库创建能力
-- Nginx，如需 Nginx 配置管理能力
-- SSH 可达，用于远程服务器操作
-
-## 安装依赖
-
-建议使用 Conda 或虚拟环境：
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-Conda 示例：
-
-```bash
-conda create -n project_management python=3.12 -y
-conda activate project_management
-pip install -r requirements.txt
+```text
+app/
+  api/          API 路由
+  core/         配置、数据库、Redis、日志和应用初始化
+  crud/         数据访问层
+  models/       SQLAlchemy ORM 模型
+  schemas/      Pydantic 请求与响应模型
+  services/     项目创建、设置、检测、启动、删除等业务服务
+  utils/        Shell、Nginx、数据库、路径等工具函数
+commands/       命令行扩展
+artisan.py      初始化、迁移等管理命令
+main.py         应用入口
 ```
 
 ## 配置
@@ -79,21 +78,19 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-根据实际环境修改数据库、Redis、JWT 密钥等配置。
-
-可以生成 JWT 密钥：
+生成 JWT 密钥：
 
 ```bash
 python artisan.py init
 ```
 
-## 数据库迁移
+## 初始化数据库
 
 ```bash
 python artisan.py migrate
 ```
 
-如果需要清空后重建表结构：
+如需重建表结构：
 
 ```bash
 python artisan.py migrate --refresh
@@ -105,26 +102,18 @@ python artisan.py migrate --refresh
 python main.py -host 0.0.0.0 -port 8888
 ```
 
-API 文档默认地址：
+API 文档地址：
 
 ```text
 http://127.0.0.1:8888/api/docs
 ```
 
-## 前端项目
-
-前端仓库：
+## 前端仓库
 
 ```text
 https://github.com/Linwangithub/python_project_management_frontend
 ```
 
-## 安全说明
-
-- 不要提交 `.env`、服务器密码、数据库密码、Token 或私钥。
-- 创建服务器时保存的 root 密码属于敏感信息，请仅在可信环境中使用。
-- 删除项目、删除 Conda 环境、删除数据库、删除 Nginx 配置属于不可逆操作，请谨慎使用。
-
-## 开源协议
+## License
 
 Apache License 2.0
