@@ -368,6 +368,7 @@ def _build_remote_nginx_inventory_command(main_conf_path: str) -> str:
   """生成远端服务器收集 Nginx 配置清单的 Python 脚本命令。"""
   conf_literal = json.dumps(str(main_conf_path or ''))
   script = r"""
+import glob
 import json
 import os
 import re
@@ -389,7 +390,7 @@ def strip_comments(text):
                 cut_at = idx
                 break
         lines.append(line if cut_at < 0 else line[:cut_at])
-    return '\\n'.join(lines)
+    return '\n'.join(lines)
 
 def direct_includes(conf_text):
     clean = strip_comments(conf_text)
@@ -398,7 +399,7 @@ def direct_includes(conf_text):
     for line in clean.splitlines():
         line_text = line.strip()
         if depth == 0:
-            m = re.match(r'^include\\s+([^;]+);', line_text)
+            m = re.match(r'^include\s+([^;]+);', line_text)
             if m:
                 result.append(m.group(1).strip())
         depth += line.count('{') - line.count('}')
@@ -409,7 +410,7 @@ def direct_includes(conf_text):
 def named_block_inner_ranges(text, block_name):
     ranges = []
     clean = strip_comments(text)
-    pattern = re.compile(r'(^|\\n)\\s*' + re.escape(block_name) + r'\\s*\\{')
+    pattern = re.compile(r'(^|\n)\s*' + re.escape(block_name) + r'\s*\{')
     for match in pattern.finditer(clean):
         brace_start = clean.find('{', match.start(0), match.end(0) + 4)
         if brace_start < 0:

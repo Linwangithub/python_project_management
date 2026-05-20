@@ -1,4 +1,4 @@
-from datetime import datetime
+﻿from datetime import datetime
 from typing import Any, List, Literal
 
 from pydantic import BaseModel, Field
@@ -551,6 +551,32 @@ class ProjectSyncNginxServerBlockCheckData(BaseModel):
 class ProjectSyncNginxServerBlockCheckResponse(base.BaseResponse):
     """同步已有项目 Nginx server 块检查接口响应。"""
     data: ProjectSyncNginxServerBlockCheckData
+
+
+class ProjectSyncNginxServerPortOptionsRequest(BaseModel):
+    """同步已有项目时查询已有 Nginx server 端口选项的请求体。"""
+    server_ip: str = Field(..., description='Project server IP')
+    nginx_server_ip: str = Field('', description='Nginx server IP')
+    nginx_conf_path: str = Field(..., description='Existing nginx config file path')
+
+
+class ProjectSyncNginxServerPortOption(BaseModel):
+    """同步已有项目可选择的一组 Nginx 前端端口和后端代理端口。"""
+    label: str = Field('', description='Display label')
+    frontend_port: str = Field('', description='Nginx listen port')
+    backend_deploy_port: str = Field('', description='proxy_pass backend port')
+    server_name: str = Field('', description='server_name value')
+    nginx_config_text: str = Field('', description='Matched server block text')
+
+
+class ProjectSyncNginxServerPortOptionsData(BaseModel):
+    """同步已有项目 Nginx server 端口选项数据。"""
+    options: List[ProjectSyncNginxServerPortOption] = Field(default_factory=list, description='Port option list')
+
+
+class ProjectSyncNginxServerPortOptionsResponse(base.BaseResponse):
+    """同步已有项目 Nginx server 端口选项接口响应。"""
+    data: ProjectSyncNginxServerPortOptionsData = Field(default_factory=ProjectSyncNginxServerPortOptionsData)
 
 
 class ProjectSyncRequest(BaseModel):

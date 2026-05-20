@@ -1,11 +1,8 @@
-import os
+﻿import os
 import shlex
-from typing import Any
-
 from fastapi import HTTPException
 
 from app import crud, schemas
-from app.core.deps import get_settings
 from app.services.pspm.project_detail import record_project_operation, snapshot_project_config
 from app.services.pspm.project_helpers import (
   frontend_root_for_project,
@@ -17,18 +14,15 @@ from app.utils.pspm.db_utils import (
   _check_server_mysql_connectable,
   _list_database_names,
   _safe_db_host,
-  _safe_db_identifier,
   _safe_optional_db_name,
   _safe_db_port,
   _safe_db_user,
 )
 from app.utils.pspm.nginx_utils import (
-  _check_nginx_port_conflict_on_server,
   _collect_nginx_conf_inventory_on_server,
   _find_server_block_ranges,
   _get_running_nginx_conf_path_on_server,
   _is_nginx_running_on_server,
-  _is_port_in_use_on_server,
   _read_text_on_server,
   _server_block_listen_ports,
   _server_block_proxy_pass_ports,
@@ -352,6 +346,30 @@ async def check_sync_database_service(payload: schemas.pspm.ProjectSyncDatabaseC
   )
 
 
+def _safe_existing_database_name_from_list(database_name: str, visible_databases: list[str]) -> str:
+  """校验同步已有项目选择的数据库名必须来自服务器实际数据库列表。
+
+  参数：
+  - database_name：前端下拉框选中的数据库名。
+  - visible_databases：当前账号通过 `SHOW DATABASES` 查询到的业务数据库列表。
+
+  作用：
+  - 同步已有项目不是创建新数据库，不能复用只允许字母数字下划线的创建数据库校验。
+  - 只允许选择真实存在且当前账号可见的数据库名，避免前端手工篡改提交值。
+
+  返回：
+  - 原始数据库名，保留短横线、点号、中文等 MySQL 已存在库名字符。
+  """
+  value = str(database_name or '').strip()
+  if not value:
+    raise HTTPException(status_code=400, detail='数据库名不能为空')
+  for item in visible_databases or []:
+    candidate = str(item or '').strip()
+    if candidate == value:
+      return candidate
+  raise HTTPException(status_code=400, detail=f'数据库不存在或当前账号不可见：{value}')
+
+
 def _find_matching_nginx_server_block(conf_text: str, frontend_port: int, backend_port: int) -> str:
   """从 Nginx 配置文本中提取匹配指定前后端端口的 server 块。
 
@@ -416,9 +434,9 @@ async def _validate_sync_nginx_config(
 
   frontend_port_int = int(nginx_frontend_port)
   backend_port_int = int(nginx_backend_port)
-  if await _is_port_in_use_on_server(nginx_server_row, frontend_port_int):
-    raise HTTPException(status_code=400, detail=f'Nginx前端端口 {frontend_port_int} 已被系统占用')
 
+  # 同步已有项目绑定的是已经存在的 server 块，listen 端口本来就应该已被 Nginx 使用，
+  # 因此这里不能沿用创建项目的“端口未占用”校验，只校验配置文件里是否存在匹配 server 块。
   # 同步已有项目只绑定已存在 Nginx 配置，不要求前端提交详细配置文本。
   # 后端读取用户选择的配置文件，自动提取同时包含 listen 前端端口和 proxy_pass 后端端口的 server 块。
   ok, file_text = await _read_text_on_server(nginx_server_row, nginx_conf_path)
@@ -438,6 +456,111 @@ async def _validate_sync_nginx_config(
     'backend_deploy_port': nginx_backend_port,
     'nginx_config_text': config_text,
   }
+
+
+def _extract_nginx_server_name(block_text: str) -> str:
+  """从单个 Nginx server 块中提取 server_name。
+
+  参数：
+  - block_text：一个完整的 server 块文本。
+
+  返回：
+  - 第一个 server_name 值；没有配置时返回空字符串。
+  """
+  import re
+
+  match = re.search(r'(?m)^\s*server_name\s+([^;]+);', str(block_text or ''))
+  if not match:
+    return ''
+  return ' '.join(match.group(1).strip().split())
+
+
+def _list_nginx_server_port_options(conf_text: str) -> list[schemas.pspm.ProjectSyncNginxServerPortOption]:
+  """从 Nginx 配置文件文本中列出可同步的 server 端口组合。
+
+  参数：
+  - conf_text：用户选择的 Nginx 配置文件完整文本。
+
+  作用：
+  - 同步已有项目时，前端端口必须从已有 listen 端口里选择。
+  - 后端部署端口由同一个 server 块中的 proxy_pass 端口自动回显。
+
+  返回：
+  - 每个包含 listen 和 proxy_pass 的 server 块组合。
+  """
+  result: list[schemas.pspm.ProjectSyncNginxServerPortOption] = []
+  seen: set[tuple[int, int, str]] = set()
+  text = str(conf_text or '')
+  for start, end in _find_server_block_ranges(text):
+    block = text[start:end].strip()
+    listen_ports = sorted(_server_block_listen_ports(block))
+    proxy_ports = sorted(_server_block_proxy_pass_ports(block))
+    if not listen_ports or not proxy_ports:
+      continue
+    server_name = _extract_nginx_server_name(block)
+    block_text = block if block.endswith('\n') else f'{block}\n'
+    for listen_port in listen_ports:
+      for proxy_port in proxy_ports:
+        key = (listen_port, proxy_port, block_text)
+        if key in seen:
+          continue
+        seen.add(key)
+        label_extra = f' · {server_name}' if server_name else ''
+        result.append(schemas.pspm.ProjectSyncNginxServerPortOption(
+          label=f'{listen_port} → {proxy_port}{label_extra}',
+          frontend_port=str(listen_port),
+          backend_deploy_port=str(proxy_port),
+          server_name=server_name,
+          nginx_config_text=block_text,
+        ))
+  return result
+
+
+async def list_sync_nginx_server_port_options_service(session, current_user, payload: schemas.pspm.ProjectSyncNginxServerPortOptionsRequest):
+  """查询同步已有项目可选择的 Nginx 前端端口和后端代理端口。
+
+  参数：
+  - session：数据库会话。
+  - current_user：当前登录用户。
+  - payload：项目服务器 IP、Nginx 服务器 IP、已选择的 Nginx 配置文件路径。
+
+  作用：
+  - 读取用户选择的真实 Nginx 配置文件。
+  - 提取所有包含 listen 和 proxy_pass 的 server 块。
+  - 前端据此把 Nginx 前端端口渲染为下拉框，后端部署端口自动回显。
+
+  返回：
+  - `ProjectSyncNginxServerPortOptionsData`，其中 options 是可同步的端口组合列表。
+  """
+  servers, project_server_row = await _get_allowed_server_by_ip(session, current_user, payload.server_ip)
+  server_ip = str(payload.server_ip or '').strip()
+  nginx_ip = str(payload.nginx_server_ip or server_ip).strip()
+  nginx_server_row = _find_server_row_by_ip(servers, nginx_ip)
+  if not nginx_server_row:
+    raise HTTPException(status_code=403, detail='当前用户无该Nginx服务器使用权限')
+
+  ping_ok, ping_msg = await _ping_from_server_to_target(project_server_row, nginx_ip)
+  if not ping_ok:
+    raise HTTPException(status_code=400, detail=f'Nginx服务器不可达：{ping_msg}')
+
+  running = await _is_nginx_running_on_server(nginx_server_row)
+  if not running:
+    raise HTTPException(status_code=400, detail='nginx服务未开启')
+
+  running_conf_path = await _get_running_nginx_conf_path_on_server(nginx_server_row)
+  inventory = await _collect_nginx_conf_inventory_on_server(nginx_server_row, running_conf_path)
+  nginx_conf_path = _validate_requested_nginx_conf_path(payload.nginx_conf_path, inventory)
+  if not await _server_file_exists(nginx_server_row, nginx_conf_path):
+    raise HTTPException(status_code=400, detail=f'Nginx配置文件不存在：{nginx_conf_path}')
+
+  ok, conf_text = await _read_text_on_server(nginx_server_row, nginx_conf_path)
+  if not ok:
+    raise HTTPException(status_code=400, detail=f'读取Nginx配置失败：{conf_text}')
+
+  options = _list_nginx_server_port_options(conf_text)
+  if not options:
+    raise HTTPException(status_code=400, detail='所选Nginx配置文件中没有可同步的 listen + proxy_pass server 块')
+  return schemas.pspm.ProjectSyncNginxServerPortOptionsData(options=options)
 
 
 async def check_sync_nginx_server_block_service(session, current_user, payload: schemas.pspm.ProjectSyncNginxServerBlockCheckRequest):
@@ -502,7 +625,6 @@ async def sync_existing_project_service(session, current_user, payload: schemas.
   db_user = ''
   db_password = ''
   if use_database:
-    database_name = _safe_db_identifier(payload.database_name)
     db_host = _safe_db_host(payload.database_host)
     db_port = _safe_db_port(payload.database_port)
     db_user = _safe_db_user(payload.database_user)
@@ -510,8 +632,8 @@ async def sync_existing_project_service(session, current_user, payload: schemas.
     ok, _message = await _check_server_mysql_connectable(db_host, db_port, db_user, db_password)
     if not ok:
       raise HTTPException(status_code=400, detail='数据库连接失败')
-    if not await _check_database_exists(db_host, db_port, db_user, db_password, database_name):
-      raise HTTPException(status_code=400, detail=f'数据库不存在：{database_name}')
+    visible_databases = await _list_database_names(db_host, db_port, db_user, db_password)
+    database_name = _safe_existing_database_name_from_list(payload.database_name, visible_databases)
 
   use_nginx = bool(payload.use_nginx)
   nginx_data: dict[str, str] = {}

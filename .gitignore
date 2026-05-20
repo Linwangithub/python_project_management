@@ -1,13 +1,11 @@
-﻿# Python
+# Python
 __pycache__/
-**/__pycache__/
 *.py[cod]
 *.pyo
 *.pyd
 *.egg-info/
 build/
 dist/
-wheels/
 
 # Virtual env
 .venv/
@@ -21,29 +19,13 @@ storage/logs/*
 !storage/logs/.gitkeep
 storage/files/*
 !storage/files/.gitkeep
-src/storage/logs/*
-!src/storage/logs/.gitkeep
-src/storage/files/*
-!src/storage/files/.gitkeep
 
 # IDE / OS
 .idea/
 .vscode/
 .DS_Store
 
-# Local backups and temporary sync files
-backups/
-*.tar.gz
+# Local backups
 *.bak
 *.bak_*
-*.bak-*
 *.failed_sync*
-*_bak_*/
-_backup*/
-src/app_bak_*/
-src/_backup*/
-
-# Local generated files
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/

@@ -1,3 +1,4 @@
+import os
 import shlex
 
 from fastapi import HTTPException
@@ -34,6 +35,7 @@ from app.utils.pspm.nginx_utils import (
   _validate_requested_nginx_conf_path,
 )
 from app.utils.pspm.path_utils import (
+  _normalize_path,
   _safe_conda_name,
   _safe_entry_file_path,
   _safe_optional_port_text,
@@ -120,6 +122,33 @@ def build_setting_actions_from_changed_fields(changed_fields: list[dict]) -> lis
   return actions
 
 
+def _safe_setting_entry_file_path(project, entry_file_path: str) -> str:
+  """校验设置弹框提交的入口文件路径。
+
+  参数：
+  - project：项目 ORM 对象，用于读取项目根目录 `backend_path`。
+  - entry_file_path：前端提交的入口文件路径，可能是相对路径或绝对路径。
+
+  作用：
+  - 新建项目后设置入口文件时，前端通常提交相对路径。
+  - 同步已有项目时，数据库中可能已经保存绝对路径。
+  - 绝对路径必须位于当前项目目录内，防止越界保存。
+
+  返回：
+  - 标准化后的入口文件路径；相对输入返回相对路径，绝对输入返回绝对路径。
+  """
+  value = _text(entry_file_path)
+  if not value:
+    raise HTTPException(status_code=400, detail='项目入口文件位置不能为空')
+  if os.path.isabs(value):
+    backend_path = _normalize_path(getattr(project, 'backend_path', '') or '')
+    target = os.path.normpath(value)
+    if target == backend_path or not target.startswith(f'{backend_path}/'):
+      raise HTTPException(status_code=400, detail='项目入口文件位置超出项目目录')
+    return target
+  return _safe_entry_file_path(value)
+
+
 def normalize_project_setting_payload(payload: schemas.pspm.ProjectSettingUpdate, project) -> tuple[dict, bool, bool, bool, bool]:
   """整理项目设置请求体，生成可写入项目表的字段字典。"""
   drop_original_database = bool(getattr(payload, 'drop_original_database', False))
@@ -142,7 +171,7 @@ def normalize_project_setting_payload(payload: schemas.pspm.ProjectSettingUpdate
     python_version_value = _text(data_in.get('python_version'))
     data_in['python_version'] = _safe_python_version(python_version_value) if python_version_value else ''
   if 'entry_file_path' in data_in:
-    data_in['entry_file_path'] = _safe_entry_file_path(data_in.get('entry_file_path') or '')
+    data_in['entry_file_path'] = _safe_setting_entry_file_path(project, data_in.get('entry_file_path') or '')
   if 'backend_dev_port' in data_in:
     data_in['backend_dev_port'] = _safe_optional_port_text(data_in.get('backend_dev_port'))
   if 'backend_deploy_port' in data_in:
@@ -282,6 +311,26 @@ async def apply_nginx_setting_change(session, current_user, project, project_ser
     )
 
     if target_tuple == original_tuple:
+      data_in['nginx_conf_path'] = original_conf_path
+      data_in['nginx_server_ip'] = original_nginx_ip
+      data_in['frontend_port'] = original_frontend_port
+      data_in['backend_deploy_port'] = original_backend_port
+      data_in['nginx_config_text'] = original_config_text
+      return actions
+
+    # 同步已有项目时，绑定的是已经存在的 Nginx server block。
+    # 这类原始 server block 可能没有系统标识，标准化配置文本会自动补充
+    # `# pspm_project 项目名`，导致纯文本比较误判为“配置已修改”。
+    # 如果 Nginx 服务器、配置文件路径、listen 端口、proxy_pass 端口都没有变化，
+    # 且用户没有选择删除原配置，则说明本次设置没有实际变更 Nginx 绑定关系。
+    # 此时必须跳过端口占用校验，否则同步进来的已有端口会被误判为被 Nginx 占用。
+    same_nginx_binding = (
+      _same_text(getattr(nginx_server_row, 'ip', '') or nginx_server_ip, original_nginx_ip)
+      and _same_text(conf_path, original_conf_path)
+      and _same_text(str(frontend_port_int), original_frontend_port)
+      and _same_text(str(backend_port_int), original_backend_port)
+    )
+    if same_nginx_binding and not drop_original_nginx_config:
       data_in['nginx_conf_path'] = original_conf_path
       data_in['nginx_server_ip'] = original_nginx_ip
       data_in['frontend_port'] = original_frontend_port
@@ -458,6 +507,11 @@ async def update_project_setting_service(session, current_user, project_id: int,
       },
     )
 
+  return {
+    'changed_fields': changed_fields,
+    'actions': action_rows,
+  }
+
 async def delete_original_project_database_service(session, current_user, project_id: int):
   """删除项目当前记录的原数据库，并同步清空项目表中的数据库配置字段。
 
@@ -524,4 +578,3 @@ async def delete_original_project_database_service(session, current_user, projec
       'actions': [f'删除原数据库：{database_name}'],
     },
   )
-

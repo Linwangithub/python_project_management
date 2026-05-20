@@ -1,6 +1,4 @@
-﻿*
-!files/
-!logs/
+*
+!files
+!logs
 !.gitignore
-!files/.gitkeep
-!logs/.gitkeep

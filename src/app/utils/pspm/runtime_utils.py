@@ -9,7 +9,6 @@ from app.utils.pspm.path_utils import (
   _normalize_path,
   _safe_command,
   _safe_conda_name,
-  _safe_entry_file_path,
   _safe_optional_port_text,
   _safe_project_shell_script,
 )
@@ -147,6 +146,29 @@ def _apply_configured_port(command: str, configured_port: str) -> str:
   )
 
 
+def _get_raw_start_command(project, mode: str) -> str:
+  """按启动模式读取对应的启动命令。
+
+  参数：
+  - project：项目 ORM 对象，提供开发和部署启动命令。
+  - mode：`dev` 读取开发启动命令，`deploy` 读取部署启动命令。
+
+  作用：
+  - 启动前先判断当前模式真正需要的命令是否已配置。
+  - 避免开发启动时错误要求部署启动命令，或者反向错误要求开发启动命令。
+
+  返回：
+  - 去掉首尾空白后的启动命令。
+  """
+  if mode == 'deploy':
+    raw_cmd = str(project.deploy_start_command or '').strip()
+  else:
+    raw_cmd = str(project.dev_start_command or '').strip()
+  if not raw_cmd:
+    raise HTTPException(status_code=400, detail='暂无配置启动命令')
+  return raw_cmd
+
+
 def _resolve_start_command(project, mode: str) -> tuple[str, str]:
   """解析项目最终启动命令。
 
@@ -155,6 +177,7 @@ def _resolve_start_command(project, mode: str) -> tuple[str, str]:
   - mode：`dev` 使用开发启动命令，`deploy` 使用部署启动命令。
 
   作用：
+  - 只校验当前启动模式对应的命令。
   - 如果命令中包含 `{port}`，则替换为设置端口。
   - 如果命令没有占位符但项目设置了端口，则尝试应用端口参数。
 
@@ -163,7 +186,7 @@ def _resolve_start_command(project, mode: str) -> tuple[str, str]:
   """
   selected_port = ''
   if mode == 'deploy':
-    raw_cmd = _safe_command(project.deploy_start_command or '', '部署启动命令')
+    raw_cmd = _safe_command(_get_raw_start_command(project, mode), '部署启动命令')
     selected_port = _safe_optional_port_text(project.backend_deploy_port or '')
     cmd = raw_cmd
     if '{port}' in raw_cmd:
@@ -174,7 +197,7 @@ def _resolve_start_command(project, mode: str) -> tuple[str, str]:
       cmd = _apply_configured_port(raw_cmd, selected_port)
     return cmd, selected_port
 
-  raw_cmd = _safe_command(project.dev_start_command or '', '开发启动命令')
+  raw_cmd = _safe_command(_get_raw_start_command(project, mode), '开发启动命令')
   selected_port = _safe_optional_port_text(project.backend_dev_port or '')
   cmd = raw_cmd
   if '{port}' in raw_cmd:
@@ -186,38 +209,60 @@ def _resolve_start_command(project, mode: str) -> tuple[str, str]:
   return cmd, selected_port
 
 
-def _assert_entry_file_exists(project):
-  """确认项目入口文件真实存在且没有越界。
+def _resolve_entry_file_abs_path(project) -> str:
+  """解析入口文件的绝对路径并确认文件存在。
 
   参数：
   - project：项目 ORM 对象，提供 `backend_path` 和 `entry_file_path`。
 
   作用：
-  - 启动服务前必须确认入口文件存在，否则启动命令容易产生误导性错误。
+  - 同步项目可能保存绝对入口文件路径。
+  - 新建后设置的项目可能保存相对入口文件路径。
+  - 统一解析成绝对路径，并确保入口文件没有越过项目目录。
+
+  返回：
+  - 入口文件绝对路径。
   """
   backend_path = _normalize_path(project.backend_path or '')
-  entry_file = _safe_entry_file_path(project.entry_file_path or '')
-  target = os.path.normpath(os.path.join(backend_path, entry_file))
+  entry_value = str(project.entry_file_path or '').strip()
+  if not entry_value:
+    raise HTTPException(status_code=400, detail='项目入口文件位置不能为空')
+
+  if os.path.isabs(entry_value):
+    target = os.path.normpath(entry_value)
+    display_path = target
+  else:
+    entry_file = os.path.normpath(entry_value).replace('\\', '/')
+    if entry_file in {'.', ''} or entry_file.startswith('../') or entry_file == '..':
+      raise HTTPException(status_code=400, detail='项目入口文件位置不合法')
+    target = os.path.normpath(os.path.join(backend_path, entry_file))
+    display_path = entry_file
+
   if not target.startswith(f'{backend_path}/') and target != backend_path:
     raise HTTPException(status_code=400, detail='项目入口文件位置超出项目目录')
   if not os.path.isfile(target):
-    raise HTTPException(status_code=400, detail=f'项目入口文件不存在：{entry_file}')
+    raise HTTPException(status_code=400, detail=f'项目入口文件不存在：{display_path}')
+  return target
 
 
-def _ensure_project_runtime_config(project):
+def _ensure_project_runtime_config(project, mode: str) -> str:
   """启动前校验项目运行配置完整性。
 
   参数：
   - project：项目 ORM 对象。
+  - mode：当前启动模式，只校验该模式需要的启动命令。
 
   作用：
-  - 统一校验项目路径、Conda 环境、入口文件、开发启动命令和部署启动命令。
+  - 先校验当前模式启动命令，未配置时返回清晰提示。
+  - 再校验项目路径、Conda 环境和入口文件。
+
+  返回：
+  - 入口文件绝对路径，供启动脚本切换工作目录。
   """
+  _get_raw_start_command(project, mode)
   _normalize_path(project.backend_path or '')
   _safe_conda_name(project.conda_env_name or '')
-  _assert_entry_file_exists(project)
-  _safe_command(project.dev_start_command or '', '开发启动命令')
-  _safe_command(project.deploy_start_command or '', '部署启动命令')
+  return _resolve_entry_file_abs_path(project)
 
 
 async def _start_project_process(
@@ -241,8 +286,8 @@ async def _start_project_process(
   返回：
   - 启动成功文案，可能包含 PID 和端口。
   """
-  _ensure_project_runtime_config(project)
-  backend_path = _normalize_path(project.backend_path or '')
+  entry_abs_path = _ensure_project_runtime_config(project, mode)
+  work_dir = os.path.dirname(entry_abs_path)
   conda_name = _safe_conda_name(project.conda_env_name or '')
   command, configured_port = _resolve_start_command(project, mode)
   runtime_dir, pid_file, meta_file = _build_project_runtime_paths(project.id)
@@ -261,7 +306,7 @@ if [ -f {shlex.quote(pid_file)} ]; then
   fi
   rm -f {shlex.quote(pid_file)}
 fi
-cd {shlex.quote(backend_path)}
+cd {shlex.quote(work_dir)}
 {CONDA_INIT}
 conda activate {shlex.quote(conda_name)}
 nohup {command} >> {shlex.quote(log_file)} 2>&1 &

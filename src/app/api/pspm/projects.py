@@ -1,4 +1,4 @@
-from typing import List
+﻿from typing import List
 
 from fastapi import APIRouter, Depends, Query
 
@@ -32,6 +32,7 @@ from app.services.pspm.project_sync import (
   check_sync_conda_service,
   check_sync_database_service,
   check_sync_nginx_server_block_service,
+  list_sync_nginx_server_port_options_service,
   list_sync_conda_envs_service,
   list_sync_entry_path_children_service,
   list_sync_project_path_children_service,
@@ -399,6 +400,31 @@ async def check_sync_database(
   return schemas.pspm.ProjectDatabaseCheckResponse(data=data)
 
 
+@router.post('/sync/nginx-server-port-options', name='同步项目Nginx端口选项', response_model=schemas.pspm.ProjectSyncNginxServerPortOptionsResponse)
+async def list_sync_nginx_server_port_options(
+  *,
+  session: SessionDep,
+  current_user=Depends(require_permission('project_management', 'create')),
+  payload: schemas.pspm.ProjectSyncNginxServerPortOptionsRequest,
+):
+  """查询同步已有项目时某个 Nginx 配置文件内已有的端口组合。
+
+  参数：
+  - session：数据库会话。
+  - current_user：当前登录用户，需要项目创建权限。
+  - payload：项目服务器 IP、Nginx 服务器 IP、已选择的配置文件路径。
+
+  作用：
+  - 同步已有项目不是创建新端口，而是选择已有 Nginx server 块。
+  - 返回 listen 前端端口下拉选项，并携带同块 proxy_pass 后端端口。
+
+  返回：
+  - ProjectSyncNginxServerPortOptionsResponse，data.options 为端口组合列表。
+  """
+  data = await list_sync_nginx_server_port_options_service(session, current_user, payload)
+  return schemas.pspm.ProjectSyncNginxServerPortOptionsResponse(data=data)
+
+
 @router.post('/sync/check-nginx-server-block', name='同步项目检查Nginx server块', response_model=schemas.pspm.ProjectSyncNginxServerBlockCheckResponse)
 async def check_sync_nginx_server_block(
   *,
@@ -510,8 +536,8 @@ async def update_project_setting(
   返回：
   - `BaseResponse`，message 为设置保存成功。
   """
-  await update_project_setting_service(session, current_user, project_id, payload)
-  return schemas.base.BaseResponse(message='设置保存成功')
+  data = await update_project_setting_service(session, current_user, project_id, payload)
+  return schemas.base.ItemResponse(message='设置保存成功', data=data)
 
 
 @router.delete('/database/original', name='删除原数据库', response_model=schemas.base.BaseResponse)
