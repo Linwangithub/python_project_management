@@ -28,6 +28,15 @@ from app.services.pspm.project_setting import (
   delete_original_project_database_service,
   update_project_setting_service,
 )
+from app.services.pspm.project_sync import (
+  check_sync_conda_service,
+  check_sync_database_service,
+  check_sync_nginx_server_block_service,
+  list_sync_conda_envs_service,
+  list_sync_entry_path_children_service,
+  list_sync_project_path_children_service,
+  sync_existing_project_service,
+)
 from app.utils.pspm.project_config import DELETE_SCOPE_PROJECT_ONLY
 
 # 项目管理路由对象：被 app/api/api.py 通过 /pspm/projects 前缀挂载。
@@ -302,6 +311,129 @@ async def check_project_port(
   """
   data = await check_project_port_service(session, current_user, payload)
   return schemas.pspm.ProjectPortCheckResponse(data=data)
+
+
+@router.post('/sync/path-children', name='同步项目目录子项', response_model=schemas.pspm.ProjectSyncPathChildrenResponse)
+async def list_sync_project_path_children(
+  *,
+  session: SessionDep,
+  current_user=Depends(require_permission('project_management', 'create')),
+  payload: schemas.pspm.ProjectSyncPathChildrenRequest,
+):
+  """查询同步已有项目时可选择的项目目录子项。
+
+  参数：
+  - session：数据库会话。
+  - current_user：当前登录用户，需要项目创建权限。
+  - payload：服务器 IP 和相对项目根目录路径。
+
+  作用：
+  - 同步已有项目弹框使用该接口逐层选择已经存在的项目目录。
+  - 后端强制目录位于 `/root/project` 或 `/home/{username}/project` 配置前缀下。
+
+  返回：
+  - ProjectSyncPathChildrenResponse，data 为目录节点列表。
+  """
+  data = await list_sync_project_path_children_service(session, current_user, payload)
+  return schemas.pspm.ProjectSyncPathChildrenResponse(data=data)
+
+
+@router.post('/sync/entry-path-children', name='同步项目入口文件子项', response_model=schemas.pspm.ProjectSyncEntryPathChildrenResponse)
+async def list_sync_entry_path_children(
+  *,
+  session: SessionDep,
+  current_user=Depends(require_permission('project_management', 'create')),
+  payload: schemas.pspm.ProjectSyncEntryPathChildrenRequest,
+):
+  """查询同步已有项目时入口文件选择器的子项。
+
+  参数：
+  - session：数据库会话。
+  - current_user：当前登录用户，需要项目创建权限。
+  - payload：服务器 IP、已选择项目目录和当前相对路径。
+
+  作用：
+  - 同步已有项目弹框在选择项目目录后，逐层选择具体入口文件。
+  - 后端只允许读取已选择项目目录内部的文件和文件夹。
+
+  返回：
+  - ProjectSyncEntryPathChildrenResponse，data 为目录/文件节点列表。
+  """
+  data = await list_sync_entry_path_children_service(session, current_user, payload)
+  return schemas.pspm.ProjectSyncEntryPathChildrenResponse(data=data)
+
+
+@router.post('/sync/conda-envs', name='同步项目Conda环境列表', response_model=schemas.pspm.ProjectSyncCondaEnvListResponse)
+async def list_sync_conda_envs(
+  *,
+  session: SessionDep,
+  current_user=Depends(require_permission('project_management', 'create')),
+  payload: schemas.pspm.ProjectSyncCondaEnvListRequest,
+):
+  """查询同步已有项目时某台服务器上的 Conda 环境列表。"""
+  data = await list_sync_conda_envs_service(session, current_user, payload)
+  return schemas.pspm.ProjectSyncCondaEnvListResponse(data=data)
+
+
+@router.post('/sync/check-conda', name='同步项目检查Conda环境', response_model=schemas.pspm.ProjectSyncCondaCheckResponse)
+async def check_sync_conda(
+  *,
+  session: SessionDep,
+  current_user=Depends(require_permission('project_management', 'create')),
+  payload: schemas.pspm.ProjectSyncCondaCheckRequest,
+):
+  """检查同步已有项目选择的 Conda 环境是否存在，并返回实际 Python 版本。"""
+  data = await check_sync_conda_service(session, current_user, payload)
+  return schemas.pspm.ProjectSyncCondaCheckResponse(data=data)
+
+
+@router.post('/sync/check-database', name='同步项目检查数据库', response_model=schemas.pspm.ProjectSyncDatabaseCheckResponse)
+async def check_sync_database(
+  *,
+  current_user=Depends(require_permission('project_management', 'create')),
+  payload: schemas.pspm.ProjectSyncDatabaseCheckRequest,
+):
+  """检查同步已有项目绑定的数据库是否已经存在且可连接。"""
+  _ = current_user
+  data = await check_sync_database_service(payload)
+  return schemas.pspm.ProjectDatabaseCheckResponse(data=data)
+
+
+@router.post('/sync/check-nginx-server-block', name='同步项目检查Nginx server块', response_model=schemas.pspm.ProjectSyncNginxServerBlockCheckResponse)
+async def check_sync_nginx_server_block(
+  *,
+  session: SessionDep,
+  current_user=Depends(require_permission('project_management', 'create')),
+  payload: schemas.pspm.ProjectSyncNginxServerBlockCheckRequest,
+):
+  """检查同步已有项目的 Nginx 配置文件中是否存在匹配端口的 server 块。"""
+  data = await check_sync_nginx_server_block_service(session, current_user, payload)
+  return schemas.pspm.ProjectSyncNginxServerBlockCheckResponse(data=data)
+
+
+@router.post('/sync', name='同步已有项目', response_model=schemas.pspm.ProjectSyncResponse)
+async def sync_existing_project(
+  *,
+  session: SessionDep,
+  current_user=Depends(require_permission('project_management', 'create')),
+  payload: schemas.pspm.ProjectSyncRequest,
+):
+  """同步已经存在的项目到系统。
+
+  参数：
+  - session：数据库会话。
+  - current_user：当前登录用户，需要项目创建权限。
+  - payload：项目目录、Conda、可选数据库和可选 Nginx 配置。
+
+  作用：
+  - 只登记已存在资源，不创建目录、不创建 Conda、不创建数据库、不写 Nginx 配置文件。
+  - 每一项已选资源都会在后端再次检测是否存在、是否可用。
+
+  返回：
+  - ProjectSyncResponse，包含新登记项目 ID 和关键配置。
+  """
+  data = await sync_existing_project_service(session, current_user, payload)
+  return schemas.pspm.ProjectSyncResponse(message='同步成功', data=data)
 
 
 @router.post('/create-real', name='真实创建项目', response_model=schemas.pspm.ProjectRealCreateResponse)

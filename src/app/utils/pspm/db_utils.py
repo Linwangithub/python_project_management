@@ -185,6 +185,39 @@ async def _check_database_exists(host: str, port: int, username: str, password: 
     await engine.dispose()
 
 
+async def _list_database_names(host: str, port: int, username: str, password: str) -> list[str]:
+  """查询当前账号可见的业务数据库名称列表。
+
+  参数：
+  - host/port/username/password：数据库连接信息。
+
+  作用：
+  - 同步已有项目时，先测试 MySQL 连接。
+  - 连接通过后返回数据库下拉框选项，用户只能从已存在数据库中选择。
+
+  返回：
+  - 数据库名称列表，已过滤 MySQL 系统库。
+  """
+  system_databases = {'information_schema', 'mysql', 'performance_schema', 'sys'}
+  engine = create_async_engine(
+    _build_db_url(host, port, username, password, 'mysql'),
+    pool_pre_ping=True,
+    pool_recycle=3600,
+    connect_args={'connect_timeout': 5},
+  )
+  try:
+    async with engine.connect() as conn:
+      result = await conn.execute(sa_text('SHOW DATABASES'))
+      names = []
+      for row in result:
+        name = str(row[0] or '').strip()
+        if name and name not in system_databases:
+          names.append(name)
+      return sorted(names)
+  finally:
+    await engine.dispose()
+
+
 async def _create_database_utf8mb4(host: str, port: int, username: str, password: str, db_name: str) -> None:
   """创建 utf8mb4 编码数据库。
 

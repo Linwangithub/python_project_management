@@ -446,6 +446,150 @@ class ProjectCondaEnvListResponse(base.BaseResponse):
     data: ProjectCondaEnvListData = Field(default_factory=ProjectCondaEnvListData, description='Conda env list data')
 
 
+class ProjectSyncPathChildrenRequest(BaseModel):
+    """同步已有项目时查询项目目录子项的请求体。"""
+    server_ip: str = Field(..., description='Server IP')
+    rel_path: str = Field('', description='Relative path under configured project base path')
+
+
+class ProjectSyncPathNode(BaseModel):
+    """同步已有项目目录选择器节点。"""
+    label: str = Field(..., description='Display label')
+    value: str = Field(..., description='Relative path value')
+    abs_path: str = Field(..., description='Absolute path on server')
+    leaf: bool = Field(False, description='Whether node is leaf')
+
+
+class ProjectSyncPathChildrenResponse(base.BaseResponse):
+    """同步已有项目目录子项接口响应。"""
+    data: List[ProjectSyncPathNode] = Field(default_factory=list, description='Directory nodes')
+
+
+class ProjectSyncEntryPathChildrenRequest(BaseModel):
+    """同步已有项目时查询入口文件子项的请求体。"""
+    server_ip: str = Field(..., description='Server IP')
+    backend_path: str = Field(..., description='Existing project directory')
+    rel_path: str = Field('', description='Relative path under selected project directory')
+
+
+class ProjectSyncEntryPathChildrenResponse(base.BaseResponse):
+    """同步已有项目入口文件子项接口响应。"""
+    data: List[ProjectEntryPathNode] = Field(default_factory=list, description='Entry file nodes')
+
+
+class ProjectSyncCondaEnvListRequest(BaseModel):
+    """同步已有项目时查询服务器 Conda 环境列表的请求体。"""
+    server_ip: str = Field(..., description='Server IP')
+
+
+class ProjectSyncCondaEnvListData(BaseModel):
+    """同步已有项目 Conda 环境列表数据。"""
+    envs_dir: str = Field('', description='Conda envs directory')
+    envs: List[str] = Field(default_factory=list, description='Conda env names')
+
+
+class ProjectSyncCondaEnvListResponse(base.BaseResponse):
+    """同步已有项目 Conda 环境列表接口响应。"""
+    data: ProjectSyncCondaEnvListData = Field(default_factory=ProjectSyncCondaEnvListData, description='Conda env list data')
+
+
+class ProjectSyncCondaCheckRequest(BaseModel):
+    """同步已有项目时检查 Conda 环境的请求体。"""
+    server_ip: str = Field(..., description='Server IP')
+    conda_env_name: str = Field(..., description='Conda env name')
+
+
+class ProjectSyncCondaCheckData(BaseModel):
+    """同步已有项目 Conda 检查结果。"""
+    ok: bool = Field(False, description='Whether conda env exists and python version is detected')
+    env_name: str = Field('', description='Conda env name')
+    env_path: str = Field('', description='Conda env path')
+    python_version: str = Field('', description='Actual Python version')
+    message: str = Field('', description='Check message')
+
+
+class ProjectSyncCondaCheckResponse(base.BaseResponse):
+    """同步已有项目 Conda 检查接口响应。"""
+    data: ProjectSyncCondaCheckData
+
+
+class ProjectSyncDatabaseCheckRequest(BaseModel):
+    """同步已有项目时检查数据库连接的请求体。"""
+    host: str = Field(..., description='Database host')
+    port: int = Field(..., description='Database port')
+    username: str = Field(..., description='Database user')
+    password: str = Field('', description='Database password')
+    database_name: str = Field('', description='Optional database name that must already exist')
+
+
+class ProjectSyncDatabaseCheckData(ProjectDatabaseCheckResponseData):
+    """同步已有项目数据库连接检查结果。"""
+    databases: list[str] = Field(default_factory=list, description='Visible database names')
+
+
+class ProjectSyncDatabaseCheckResponse(base.BaseResponse):
+    """同步已有项目数据库检查接口响应。"""
+    data: ProjectSyncDatabaseCheckData
+
+
+class ProjectSyncNginxServerBlockCheckRequest(BaseModel):
+    """同步已有项目时检查 Nginx server 块是否匹配的请求体。"""
+    server_ip: str = Field(..., description='Project server IP')
+    nginx_server_ip: str = Field('', description='Nginx server IP')
+    nginx_conf_path: str = Field(..., description='Existing nginx config file path')
+    frontend_port: str = Field(..., description='Nginx frontend listen port')
+    backend_deploy_port: str = Field(..., description='Backend deploy port in proxy_pass')
+
+
+class ProjectSyncNginxServerBlockCheckData(BaseModel):
+    """同步已有项目 Nginx server 块检查结果。"""
+    ok: bool = Field(False, description='Whether matched server block exists')
+    nginx_config_text: str = Field('', description='Matched server block text')
+    message: str = Field('', description='Check message')
+
+
+class ProjectSyncNginxServerBlockCheckResponse(base.BaseResponse):
+    """同步已有项目 Nginx server 块检查接口响应。"""
+    data: ProjectSyncNginxServerBlockCheckData
+
+
+class ProjectSyncRequest(BaseModel):
+    """同步已有项目最终提交请求体。"""
+    server_ip: str = Field(..., description='Project server IP')
+    name: str = Field(..., description='Project name')
+    description: str = Field('', description='Project description')
+    backend_path: str = Field(..., description='Existing project directory')
+    entry_file_path: str = Field('', description='Entry file absolute path')
+    conda_env_name: str = Field(..., description='Existing Conda env name')
+    python_version: str = Field('', description='Detected Python version')
+    use_database: bool = Field(False, description='Whether to bind existing database')
+    database_name: str = Field('', description='Existing database name')
+    database_host: str = Field('', description='Database host')
+    database_port: int | None = Field(None, description='Database port')
+    database_user: str = Field('', description='Database user')
+    database_password: str = Field('', description='Database password')
+    use_nginx: bool = Field(False, description='Whether to bind existing nginx config')
+    nginx_server_ip: str = Field('', description='Nginx server IP')
+    nginx_conf_path: str = Field('', description='Existing nginx config file path')
+    frontend_port: str = Field('', description='Nginx frontend port')
+    backend_deploy_port: str = Field('', description='Backend deploy port in proxy_pass')
+    nginx_config_text: str = Field('', description='Nginx server block text')
+
+
+class ProjectSyncResponseData(BaseModel):
+    """同步已有项目结果数据。"""
+    project_id: int = Field(..., description='Project ID')
+    status: str = Field('同步成功', description='Sync status')
+    backend_path: str = Field(..., description='Existing project directory')
+    conda_env_name: str = Field(..., description='Conda env name')
+    python_version: str = Field('', description='Python version')
+
+
+class ProjectSyncResponse(base.BaseResponse):
+    """同步已有项目接口响应。"""
+    data: ProjectSyncResponseData
+
+
 class ProjectCopyRequest(BaseModel):
     """复制项目请求体。"""
     target_server_ip: str = Field(..., description='Target server IP')

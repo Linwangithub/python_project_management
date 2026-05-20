@@ -1,4 +1,5 @@
 import asyncio
+import ipaddress
 import re
 import shlex
 import socket
@@ -21,11 +22,19 @@ def _list_local_ips() -> set[str]:
   - 如果是本机，则直接执行本地 shell；否则通过 SSH 执行远端 shell。
 
   返回：
-  - IP 集合，包含固定本机地址和 hostname 解析出的地址。
+  - IP 集合，包含回环地址、配置兜底地址和 hostname 解析出的地址。
   """
-  ips = set(LOCAL_SERVER_IPS)
+  ips = {str(x or '').strip() for x in LOCAL_SERVER_IPS if str(x or '').strip()}
+  ips.update({'127.0.0.1', '::1', 'localhost'})
   try:
     ips.update(socket.gethostbyname_ex(socket.gethostname())[2] or [])
+  except Exception:
+    pass
+  try:
+    for item in socket.getaddrinfo(socket.gethostname(), None):
+      addr = item[4][0]
+      if addr:
+        ips.add(addr)
   except Exception:
     pass
   return ips
@@ -63,6 +72,51 @@ async def _run_shell(command: str, cwd: str | None = None, timeout: int = 1800) 
   stdout = (stdout_b or b'').decode('utf-8', errors='replace')
   stderr = (stderr_b or b'').decode('utf-8', errors='replace')
   return int(proc.returncode or 0), stdout, stderr
+
+
+async def _list_local_ips_async() -> set[str]:
+  """动态读取当前后端机器真实网卡 IP。
+
+  参数：
+  - 无。
+
+  作用：
+  - 服务器管理中的 IP 存在数据库里，不应该写死在代码中。
+  - 当数据库里的服务器 IP 正好是当前后端机器自身 IP 时，直接本机执行命令，不走 SSH。
+  - 当数据库里的服务器 IP 是其他机器时，才走 SSH/sshpass。
+
+  返回：
+  - 当前后端机器可识别的本机 IP 集合。
+  """
+  ips = _list_local_ips()
+  commands = [
+    "hostname -I 2>/dev/null || true",
+    "ip -o -4 addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 || true",
+    "ip -o -6 addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 || true",
+  ]
+  for command in commands:
+    code, out, _err = await _run_shell(command, timeout=5)
+    if code != 0:
+      continue
+    for token in re.split(r'\s+', out.strip()):
+      value = token.strip()
+      if value:
+        ips.add(value)
+  return {x for x in ips if x}
+
+
+def _same_ip(left: str, right: str) -> bool:
+  """判断两个 IP/主机标识是否指向同一个地址。"""
+  a = str(left or '').strip().lower()
+  b = str(right or '').strip().lower()
+  if not a or not b:
+    return False
+  if a == b:
+    return True
+  try:
+    return ipaddress.ip_address(a) == ipaddress.ip_address(b)
+  except Exception:
+    return False
 
 
 def _split_lines(text: str) -> List[str]:
@@ -112,7 +166,14 @@ def _is_local_server_ip(server_ip: str) -> bool:
   返回：
   - True 表示本机；False 表示需要远端 SSH。
   """
-  return (server_ip or '').strip() in _list_local_ips()
+  target = str(server_ip or '').strip()
+  return any(_same_ip(target, ip) for ip in _list_local_ips())
+
+
+async def _is_local_server_ip_async(server_ip: str) -> bool:
+  """异步判断服务器 IP 是否为当前后端本机。"""
+  target = str(server_ip or '').strip()
+  return any(_same_ip(target, ip) for ip in await _list_local_ips_async())
 
 
 async def _shell_command_exists(command_name: str) -> bool:
@@ -134,6 +195,34 @@ async def _shell_command_exists(command_name: str) -> bool:
   return code == 0
 
 
+def _build_ssh_askpass_command(password: str, ssh_opts: str, remote: str, quoted_command: str) -> str:
+  """构建不依赖 sshpass 的密码 SSH 命令。
+
+  参数：
+  - password：服务器管理中保存的 root 密码。
+  - ssh_opts：统一的 SSH 选项。
+  - remote：SSH 目标，例如 `root@192.168.31.130`。
+  - quoted_command：已经 shell quote 后的远端命令。
+
+  作用：
+  - 当后端服务器没有安装 `sshpass` 时，使用 OpenSSH 原生的 `SSH_ASKPASS` 机制输入密码。
+  - 临时 askpass 脚本只在单次命令执行期间存在，执行结束后由 trap 自动清理。
+
+  返回：
+  - 可交给 `_run_shell` 执行的 bash 命令字符串。
+  """
+  askpass_body = f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(str(password or ''))}\n"
+  askpass_body_quoted = shlex.quote(askpass_body)
+  return (
+    'askpass_script=$(mktemp /tmp/pspm_askpass_XXXXXX) || exit 90; '
+    'trap \'rm -f "$askpass_script"\' EXIT; '
+    f'printf %s {askpass_body_quoted} > "$askpass_script"; '
+    'chmod 700 "$askpass_script"; '
+    'DISPLAY=pspm:0 SSH_ASKPASS="$askpass_script" SSH_ASKPASS_REQUIRE=force '
+    f'setsid ssh -o NumberOfPasswordPrompts=1 {ssh_opts} {remote} {quoted_command} < /dev/null'
+  )
+
+
 async def _run_server_shell(server_row, command: str, timeout: int = 60) -> tuple[int, str, str]:
   """在指定业务服务器执行 shell 命令。
 
@@ -152,7 +241,7 @@ async def _run_server_shell(server_row, command: str, timeout: int = 60) -> tupl
   ip = str(getattr(server_row, 'ip', '') or '').strip()
   if not ip:
     return 2, '', '服务器IP不能为空'
-  if _is_local_server_ip(ip):
+  if await _is_local_server_ip_async(ip):
     return await _run_shell(command, timeout=timeout)
 
   if not re.match(r'^[A-Za-z0-9_.:-]+$', ip):
@@ -164,9 +253,12 @@ async def _run_server_shell(server_row, command: str, timeout: int = 60) -> tupl
   quoted_command = shlex.quote(command)
 
   if password:
-    if not await _shell_command_exists('sshpass'):
-      return 127, '', '当前后端未安装sshpass，无法使用root密码进行非交互SSH检测'
-    shell_cmd = f'sshpass -p {shlex.quote(password)} ssh {ssh_opts} {remote} {quoted_command}'
+    if await _shell_command_exists('sshpass'):
+      shell_cmd = f'sshpass -p {shlex.quote(password)} ssh {ssh_opts} {remote} {quoted_command}'
+    elif await _shell_command_exists('setsid'):
+      shell_cmd = _build_ssh_askpass_command(password, ssh_opts, remote, quoted_command)
+    else:
+      return 127, '', '当前后端未安装sshpass，且缺少setsid，无法使用root密码进行非交互SSH检测'
   else:
     shell_cmd = f'ssh {ssh_opts} -o BatchMode=yes {remote} {quoted_command}'
 
