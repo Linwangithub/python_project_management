@@ -44,9 +44,35 @@ async def get_current_active_user(current_user: schemas.users.Data = Depends(get
     return current_user
 
 
+def _extract_ws_token(websocket: WebSocket) -> str:
+    """从 WebSocket 请求中提取登录令牌。
+
+    前端终端窗口通过 WebSocket 建立独立会话。浏览器不能直接给
+    WebSocket 设置 Authorization 请求头，所以这里优先从 query string
+    的 token 参数取值；同时兼容旧版本从 Sec-WebSocket-Protocol 传 JWT
+    的方式，避免已经打开的旧前端页面立即失效。
+
+    参数：
+    - websocket：FastAPI 注入的 WebSocket 连接对象。
+
+    返回：
+    - str：JWT 登录令牌；如果没有携带则返回空字符串。
+    """
+    query_token = str(websocket.query_params.get('token') or '').strip()
+    if query_token:
+        return query_token
+
+    raw_protocol = str(websocket.headers.get('sec-websocket-protocol') or '').strip()
+    for item in raw_protocol.split(','):
+        candidate = item.strip()
+        if candidate and candidate != 'pspm-terminal':
+            return candidate
+    return ''
+
+
 async def get_ws_current_user(websocket: WebSocket, db: AsyncSession = Depends(get_db)) -> schemas.users.Data:
     try:
-        token = websocket.headers.get('sec-websocket-protocol')
+        token = _extract_ws_token(websocket)
         payload = jwt.decode(
             token,
             get_settings().api.auth0.secret_key,

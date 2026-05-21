@@ -405,7 +405,7 @@ async def inspect_projects_health_service(session, current_user, result: schemas
       item.service_status = '已停止'
       item.running_port = ''
     else:
-      runtime_data = await _inspect_project_runtime(item)
+      runtime_data = await _inspect_project_runtime(server_row, item)
       item.service_status = runtime_data.get('service_status') or '已停止'
       item.running_port = runtime_data.get('running_port') or ''
 
@@ -549,7 +549,7 @@ async def inspect_project_health_service(session, current_user, project_id: int)
     item.service_status = '已停止'
     item.running_port = ''
   else:
-    runtime_data = await _inspect_project_runtime(item)
+    runtime_data = await _inspect_project_runtime(server_row, item)
     item.service_status = runtime_data.get('service_status') or '已停止'
     item.running_port = runtime_data.get('running_port') or ''
     if item.backend_path and not await _server_path_exists(server_row, item.backend_path):

@@ -1,4 +1,4 @@
-﻿from datetime import datetime
+from datetime import datetime
 from typing import Any, List, Literal
 
 from pydantic import BaseModel, Field
@@ -670,6 +670,16 @@ class TerminalExecuteRequest(BaseModel):
     """执行终端命令请求体。"""
     session_id: str = Field(..., description='Session ID')
     command: str = Field(..., description='Command')
+    mode: str | None = Field('', description='Execution mode')
+
+
+
+class ProjectForegroundFinalize(BaseModel):
+    """前台启动完成确认请求体。"""
+    project_id: int = Field(..., description='Project ID')
+    pid: str = Field(..., description='Started process PID')
+    port: str | None = Field('', description='Detected or configured port')
+    log_file: str | None = Field('', description='Current startup log file')
 
 
 class TerminalCompleteRequest(BaseModel):

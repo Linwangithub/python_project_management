@@ -1,17 +1,26 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import pty
+import re
+import select as select_module
 import shlex
+import signal
+import subprocess
 import uuid
 from typing import Any, Dict, List, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, WebSocketException, status
 from sqlalchemy import select
 
 from app import crud, models, schemas
-from app.api.deps import require_permission
+from app.api.deps import CurrentWSUser, require_permission
+from app.core.database import get_session
 from app.core.deps import SessionDep
+from app.utils.pspm.path_utils import _safe_project_shell_script
+from app.utils.pspm.shell_utils import _is_local_server_ip_async, _run_server_shell, _run_shell
 
 router = APIRouter()
 
@@ -22,6 +31,8 @@ CONDA_INIT = 'source /root/miniforge3/etc/profile.d/conda.sh >/dev/null 2>&1 || 
 
 _terminal_sessions: Dict[str, Dict[str, Any]] = {}
 _terminal_lock = asyncio.Lock()
+
+ANSI_PATTERN = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
 
 
 def _format_prompt(host_label: str, cwd: str) -> str:
@@ -41,6 +52,19 @@ def _format_prompt(host_label: str, cwd: str) -> str:
     else:
         display_path = cwd
     return f'(base) [root@{host_label} {display_path}]#'
+
+
+
+def _format_prompt_with_env(host_label: str, cwd: str, conda_env: str | None = None) -> str:
+    """根据会话保存的 Conda 环境生成提示符。"""
+    env_name = (conda_env or '').strip() or 'base'
+    if cwd == HOME_DIR:
+        display_path = '~'
+    elif cwd.startswith(f'{HOME_DIR}/'):
+        display_path = f'~{cwd[len(HOME_DIR):]}'
+    else:
+        display_path = cwd
+    return f'({env_name}) [root@{host_label} {display_path}]#'
 
 
 def _normalize_cwd(cwd: str | None) -> str:
@@ -353,6 +377,124 @@ async def _get_allowed_server_by_ip(
     raise HTTPException(status_code=403, detail='当前用户无该服务器使用权限')
 
 
+
+async def _get_allowed_server_by_id(
+    session: SessionDep,
+    current_user: schemas.users.Data,
+    server_id: int | None,
+) -> models.pspm.PspmServer:
+    """按服务器 ID 查找当前用户可使用的服务器。"""
+    if not server_id:
+        raise HTTPException(status_code=400, detail='终端会话缺少服务器ID')
+
+    candidates = await _list_allowed_servers(session, current_user)
+    for server in candidates:
+        if int(server.id) == int(server_id):
+            return server
+
+    raise HTTPException(status_code=403, detail='当前用户无该服务器使用权限')
+
+
+async def _get_session_server_row(
+    session: SessionDep,
+    current_user: schemas.users.Data,
+    session_data: Dict[str, Any],
+) -> models.pspm.PspmServer:
+    """根据终端会话中保存的 server_id/server_ip 获取真实目标服务器。"""
+    server_id = session_data.get('server_id')
+    if server_id:
+        return await _get_allowed_server_by_id(session, current_user, int(server_id))
+    return await _get_allowed_server_by_ip(session, current_user, str(session_data.get('server_ip') or ''))
+
+
+def _wrap_remote_bash(script: str) -> str:
+    """把脚本包装成可交给目标服务器执行的 bash -lc 命令。"""
+    return f'bash -lc {shlex.quote(script)}'
+
+
+async def _remote_path_is_dir(server_row, path: str) -> bool:
+    """在终端会话对应服务器上判断目录是否存在。"""
+    safe_path = shlex.quote(_normalize_cwd(path))
+    code, _out, _err = await _run_server_shell(server_row, _wrap_remote_bash(f'test -d {safe_path}'), timeout=10)
+    return code == 0
+
+
+async def _run_terminal_command_on_server(
+    server_row,
+    command: str,
+    cwd: str,
+    timeout: int,
+    conda_env_name: str = 'base',
+    detach: bool = False,
+) -> tuple[int, str, str]:
+    """在终端会话对应服务器的指定目录和 Conda 环境中执行命令。"""
+    safe_cwd = shlex.quote(_normalize_cwd(cwd))
+    env_name = (conda_env_name or 'base').strip() or 'base'
+    activate = '' if env_name == 'base' else f'conda activate {shlex.quote(env_name)} >/dev/null 2>&1 && '
+    if detach:
+        script = (
+            f'cd {safe_cwd} && {CONDA_INIT}{activate}'
+            f'log_file=$(mktemp /tmp/pspm_terminal_fg_XXXXXX.log); '
+            f': > "$log_file"; '
+            f'({command}) >> "$log_file" 2>&1 & '
+            f'pid=$!; '
+            f'echo "PSPM_PID=$pid"; '
+            f'echo "PSPM_LOG=$log_file"; '
+            f'sleep 1; '
+            f'echo "PSPM_LOG_BEGIN"; tail -n 80 "$log_file" 2>/dev/null || true; echo "PSPM_LOG_END"'
+        )
+    else:
+        script = f'cd {safe_cwd} && {CONDA_INIT}{activate}{command}'
+    return await _run_server_shell(server_row, _wrap_remote_bash(script), timeout=timeout)
+
+
+async def _complete_command_candidates_on_server(server_row, token: str) -> List[str]:
+    """在终端会话对应服务器上查询命令名补全候选项。"""
+    if not token:
+        return []
+
+    script = f'{CONDA_INIT}compgen -c -- {shlex.quote(token)} | sort -u'
+    code, out, _err = await _run_server_shell(server_row, _wrap_remote_bash(script), timeout=10)
+    if code != 0:
+        return []
+
+    values = []
+    for line in (out or '').splitlines():
+        item = (line or '').strip()
+        if item and item.startswith(token):
+            values.append(item)
+    return sorted(set(values))
+
+
+async def _complete_path_candidates_on_server(server_row, cwd: str, token: str) -> List[str]:
+    """在终端会话对应服务器上查询路径补全候选项。"""
+    base_dir, base_name = _resolve_completion_base(cwd, token)
+    script = (
+        f'base={shlex.quote(base_dir)}; '
+        'if [ -d "$base" ]; then '
+        'find "$base" -maxdepth 1 -mindepth 1 -printf "%p\\t%y\\n" 2>/dev/null; '
+        'fi'
+    )
+    code, out, _err = await _run_server_shell(server_row, _wrap_remote_bash(script), timeout=10)
+    if code != 0:
+        return []
+
+    candidates: List[str] = []
+    for line in (out or '').splitlines():
+        raw = (line or '').strip()
+        if not raw or '\t' not in raw:
+            continue
+        abs_path, kind = raw.rsplit('\t', 1)
+        name = os.path.basename(abs_path.rstrip('/'))
+        if not name.startswith(base_name):
+            continue
+        display = _to_display_path(abs_path)
+        if kind == 'd' and not display.endswith('/'):
+            display = f'{display}/'
+        candidates.append(display)
+    return sorted(set(candidates))
+
+
 async def _set_session_data(session_id: str, data: Dict[str, Any]) -> None:
     """写入内存终端会话数据。
 
@@ -422,6 +564,326 @@ async def _remove_session(session_id: str, user_id: int) -> bool:
         return True
 
 
+
+
+def _terminal_ws_response(message: str, data: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """Build a JSON message for the terminal WebSocket."""
+    return {'type': message, 'data': data or {}}
+
+
+def _strip_ansi(text: str) -> str:
+    """Remove ANSI escape sequences from terminal output."""
+    return ANSI_PATTERN.sub('', str(text or ''))
+
+
+def _extract_ws_marked_value(output: str, key: str) -> str:
+    """Extract KEY=value from shell output."""
+    prefix = f'{key}='
+    for line in str(output or '').splitlines():
+        if line.startswith(prefix):
+            return line[len(prefix):].strip()
+    return ''
+
+
+def _build_sshpass_prefix(password: str) -> str:
+    """Build an sshpass prefix for one SSH process."""
+    if not password:
+        return ''
+    safe_password = shlex.quote(str(password))
+    return f"sshpass -p {safe_password} "
+
+
+def _build_askpass_ssh_command(password: str, ssh_command: str) -> str:
+    """Build an SSH command that uses SSH_ASKPASS when sshpass is absent."""
+    askpass_body = f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(str(password or ''))}\n"
+    askpass_body_quoted = shlex.quote(askpass_body)
+    ssh_command_quoted = shlex.quote(ssh_command)
+    return (
+        'askpass_script=$(mktemp /tmp/pspm_ws_askpass_XXXXXX) || exit 90; '
+        'trap \'rm -f "$askpass_script"\' EXIT; '
+        f'printf %s {askpass_body_quoted} > "$askpass_script"; '
+        'chmod 700 "$askpass_script"; '
+        f'DISPLAY=pspm:0 SSH_ASKPASS="$askpass_script" SSH_ASKPASS_REQUIRE=force setsid bash -lc {ssh_command_quoted}'
+    )
+
+
+async def _build_terminal_process_command(server_row: models.pspm.PspmServer) -> List[str]:
+    """Build the local PTY command for a local shell or an interactive SSH shell."""
+    ip = str(getattr(server_row, 'ip', '') or '').strip()
+    if await _is_local_server_ip_async(ip):
+        return ['/bin/bash', '-l']
+
+    if not re.match(r'^[A-Za-z0-9_.:-]+$', ip):
+        raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION, reason=f'\u670d\u52a1\u5668IP\u683c\u5f0f\u4e0d\u5408\u6cd5\uff1a{ip}')
+
+    ssh_port = int(getattr(server_row, 'ssh_port', 22) or 22)
+    password = str(getattr(server_row, 'root_password', '') or '')
+    base_ssh = (
+        f"ssh -tt -p {ssh_port} "
+        "-o StrictHostKeyChecking=no "
+        "-o UserKnownHostsFile=/dev/null "
+        "-o ConnectTimeout=8 "
+        "-o LogLevel=ERROR "
+        "-o ServerAliveInterval=15 "
+        "-o ServerAliveCountMax=2 "
+        f"root@{shlex.quote(ip)}"
+    )
+
+    has_sshpass = (await _run_shell('command -v sshpass >/dev/null 2>&1', timeout=5))[0] == 0
+    if password and has_sshpass:
+        return ['/bin/bash', '-lc', f'{_build_sshpass_prefix(password)}{base_ssh}']
+
+    has_setsid = (await _run_shell('command -v setsid >/dev/null 2>&1', timeout=5))[0] == 0
+    if password and has_setsid:
+        return ['/bin/bash', '-lc', _build_askpass_ssh_command(password, base_ssh)]
+
+    if password:
+        raise WebSocketException(code=status.WS_1011_INTERNAL_ERROR, reason='\u5f53\u524d\u540e\u7aef\u7f3a\u5c11 sshpass/setsid\uff0c\u65e0\u6cd5\u521b\u5efa\u5bc6\u7801 SSH \u7ec8\u7aef')
+    return ['/bin/bash', '-lc', base_ssh]
+
+
+async def _get_ws_allowed_server_by_ip(current_user: schemas.users.Data, server_ip: str) -> models.pspm.PspmServer:
+    """Validate and load a server for the current WebSocket user."""
+    async with get_session() as db:
+        return await _get_allowed_server_by_ip(db, current_user, server_ip)
+
+
+async def _write_project_runtime_meta(
+    *,
+    server_row: models.pspm.PspmServer,
+    project_id: int,
+    pid: str,
+    port: str,
+    mode: str,
+) -> None:
+    """Write runtime pid/meta files after a foreground service becomes ready."""
+    if not str(pid or '').isdigit():
+        return
+    import time
+    runtime_dir = f'/tmp/pspm/runtime/project_{int(project_id)}'
+    pid_file = f'{runtime_dir}/service.pid'
+    meta_file = f'{runtime_dir}/service.meta'
+    start_time_cmd = f"awk '{{print $22}}' /proc/{shlex.quote(str(pid))}/stat 2>/dev/null || true"
+    code, start_time, _err = await _run_server_shell(server_row, start_time_cmd, timeout=10)
+    start_time = (start_time or '').strip() if code == 0 else ''
+    if not start_time:
+        return
+    started_at = int(time.time())
+    meta_text = f'{pid}|{start_time}|{mode}|{started_at}|{port or ""}'
+    script = f"""
+set -euo pipefail
+mkdir -p {shlex.quote(runtime_dir)}
+printf '%s\n' {shlex.quote(str(pid))} > {shlex.quote(pid_file)}
+printf '%s\n' {shlex.quote(meta_text)} > {shlex.quote(meta_file)}
+"""
+    await _run_server_shell(server_row, _safe_project_shell_script(script), timeout=10)
+
+
+async def _mark_project_running(project_id: int) -> None:
+    """Persist that a project is running."""
+    async with get_session() as db:
+        await crud.projects.update_status(db, project_id=project_id, running=True)
+
+
+async def _safe_send_json(websocket: WebSocket, payload: Dict[str, Any]) -> bool:
+    """Send a JSON message and return False if the socket is already closed."""
+    try:
+        await websocket.send_json(payload)
+        return True
+    except Exception:
+        return False
+
+
+def _write_pty(master_fd: int, text: str) -> None:
+    """Write browser input into the PTY master."""
+    os.write(master_fd, str(text or '').encode('utf-8', errors='replace'))
+
+
+async def _watch_foreground_port_ready(
+    *,
+    websocket: WebSocket,
+    server_row: models.pspm.PspmServer,
+    project_id: int,
+    port: str,
+    wait_seconds: int = 30,
+) -> None:
+    """Use a side shell to detect when the foreground service starts listening."""
+    safe_port = shlex.quote(str(port or '').strip())
+    if not str(port or '').strip():
+        await _safe_send_json(websocket, _terminal_ws_response('foreground_pending', {'message': '\u542f\u52a8\u547d\u4ee4\u5df2\u8fdb\u5165\u524d\u53f0\u8fd0\u884c\uff0c\u672a\u914d\u7f6e\u7aef\u53e3\uff0c\u8bf7\u4ee5\u7ec8\u7aef\u8f93\u51fa\u4e3a\u51c6'}))
+        return
+    script = f"""
+port={safe_port}
+for _i in $(seq 1 {int(wait_seconds)}); do
+  line="$(ss -lntpH 2>/dev/null | awk -v p="$port" '$4 ~ ":"p"$" {{print; exit}}' || true)"
+  if [ -n "$line" ]; then
+    pid="$(printf '%s\n' "$line" | sed -n 's/.*pid=\\([0-9][0-9]*\\).*/\\1/p' | head -n 1)"
+    echo "PSPM_READY=1"
+    echo "PSPM_PID=$pid"
+    exit 0
+  fi
+  sleep 1
+done
+echo "PSPM_READY=0"
+exit 23
+"""
+    code, out, err = await _run_server_shell(server_row, _safe_project_shell_script(script), timeout=wait_seconds + 10)
+    ready = _extract_ws_marked_value(out, 'PSPM_READY') == '1'
+    pid = _extract_ws_marked_value(out, 'PSPM_PID')
+    if ready and pid:
+        await _write_project_runtime_meta(server_row=server_row, project_id=project_id, pid=pid, port=port, mode='dev')
+        await _mark_project_running(project_id)
+        await _safe_send_json(websocket, _terminal_ws_response('foreground_started', {
+            'project_id': project_id,
+            'pid': pid,
+            'port': port,
+        }))
+        return
+    message = (err or out or '').strip() or '\u7b49\u5f85\u7aef\u53e3\u76d1\u542c\u8d85\u65f6\uff0c\u8bf7\u67e5\u770b\u7ec8\u7aef\u8f93\u51fa'
+    await _safe_send_json(websocket, _terminal_ws_response('foreground_pending', {'message': message}))
+
+
+@router.websocket('/ws', name='pspm_terminal_ws')
+async def terminal_websocket(
+    websocket: WebSocket,
+    current_user: CurrentWSUser,
+):
+    """Interactive terminal implemented with one isolated WebSocket + PTY per tab."""
+    await websocket.accept(subprotocol='pspm-terminal')
+    process: subprocess.Popen | None = None
+    master_fd: int | None = None
+    reader_task: asyncio.Task | None = None
+    watcher_task: asyncio.Task | None = None
+    server_row: models.pspm.PspmServer | None = None
+
+    async def reader_loop() -> None:
+        """Read PTY output and stream it back to the browser."""
+        assert master_fd is not None
+        while True:
+            try:
+                ready, _w, _e = await asyncio.to_thread(select_module.select, [master_fd], [], [], 0.2)
+                if not ready:
+                    if process and process.poll() is not None:
+                        break
+                    continue
+                data = os.read(master_fd, 4096)
+                if not data:
+                    break
+                text = data.decode('utf-8', errors='replace')
+                ok = await _safe_send_json(websocket, _terminal_ws_response('output', {'text': text}))
+                if not ok:
+                    break
+            except OSError:
+                break
+            except Exception as exc:
+                await _safe_send_json(websocket, _terminal_ws_response('error', {'message': f'\u8bfb\u53d6\u7ec8\u7aef\u8f93\u51fa\u5931\u8d25\uff1a{exc}'}))
+                break
+
+    try:
+        first = await websocket.receive_json()
+        if first.get('type') != 'open':
+            await websocket.send_json(_terminal_ws_response('error', {'message': '\u7ec8\u7aef\u9996\u5305\u5fc5\u987b\u662f open'}))
+            return
+        server_ip = str(first.get('server_ip') or '').strip()
+        alias = str(first.get('alias') or '').strip() or 'terminal'
+        if not server_ip:
+            await websocket.send_json(_terminal_ws_response('error', {'message': '\u670d\u52a1\u5668IP\u4e0d\u80fd\u4e3a\u7a7a'}))
+            return
+
+        server_row = await _get_ws_allowed_server_by_ip(current_user, server_ip)
+        command = await _build_terminal_process_command(server_row)
+        master_fd, slave_fd = pty.openpty()
+        process = subprocess.Popen(
+            command,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            start_new_session=True,
+            close_fds=True,
+        )
+        os.close(slave_fd)
+        reader_task = asyncio.create_task(reader_loop())
+        await websocket.send_json(_terminal_ws_response('ready', {
+            'session_id': uuid.uuid4().hex,
+            'server_ip': server_ip,
+            'alias': alias,
+            'pid': process.pid,
+        }))
+
+        while True:
+            data = await websocket.receive_json()
+            msg_type = str(data.get('type') or '').strip()
+            if msg_type == 'input':
+                text = str(data.get('text') or '')
+                if master_fd is not None:
+                    _write_pty(master_fd, text)
+            elif msg_type == 'run_foreground':
+                project_id = int(data.get('project_id') or 0)
+                port = str(data.get('port') or '').strip()
+                work_dir = str(data.get('work_dir') or '').strip()
+                conda_env_name = str(data.get('conda_env_name') or '').strip()
+                command_text = str(data.get('command') or '').strip()
+                if not command_text:
+                    await websocket.send_json(_terminal_ws_response('error', {'message': '\u6682\u65e0\u914d\u7f6e\u542f\u52a8\u547d\u4ee4'}))
+                    continue
+                if master_fd is not None:
+                    if work_dir:
+                        _write_pty(master_fd, f"cd {shlex.quote(work_dir)}\n")
+                        await asyncio.sleep(0.2)
+                    if conda_env_name:
+                        _write_pty(master_fd, f"conda activate {shlex.quote(conda_env_name)}\n")
+                        await asyncio.sleep(0.2)
+                    _write_pty(master_fd, f"{command_text}\n")
+                    await websocket.send_json(_terminal_ws_response('foreground_pending', {'message': '\u542f\u52a8\u547d\u4ee4\u5df2\u8fdb\u5165\u524d\u53f0\u8fd0\u884c\uff0c\u6b63\u5728\u7b49\u5f85\u7aef\u53e3\u76d1\u542c'}))
+                    if watcher_task and not watcher_task.done():
+                        watcher_task.cancel()
+                    if server_row and project_id:
+                        watcher_task = asyncio.create_task(_watch_foreground_port_ready(
+                            websocket=websocket,
+                            server_row=server_row,
+                            project_id=project_id,
+                            port=port,
+                        ))
+            elif msg_type == 'resize':
+                continue
+            elif msg_type == 'close':
+                break
+    except WebSocketDisconnect:
+        pass
+    except WebSocketException:
+        raise
+    except Exception as exc:
+        try:
+            await websocket.send_json(_terminal_ws_response('error', {'message': f'\u7ec8\u7aef\u8fde\u63a5\u5f02\u5e38\uff1a{exc}'}))
+        except Exception:
+            pass
+    finally:
+        for task in [watcher_task, reader_task]:
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except BaseException:
+                    pass
+        if process and process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGHUP)
+            except Exception:
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+        if master_fd is not None:
+            try:
+                os.close(master_fd)
+            except Exception:
+                pass
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
 @router.get('/servers', name='会话可用服务器', response_model=schemas.pspm.TerminalServerOptionsResponse)
 async def list_terminal_servers(
     *,
@@ -473,9 +935,18 @@ async def create_terminal_session(
 
     server = await _get_allowed_server_by_ip(session, current_user, payload.server_ip)
 
+    connect_code, connect_out, connect_err = await _run_server_shell(
+        server,
+        _wrap_remote_bash(f'test -d {shlex.quote(HOME_DIR)} && pwd'),
+        timeout=15,
+    )
+    if connect_code != 0:
+        msg = connect_err.strip() or connect_out.strip() or 'unknown error'
+        raise HTTPException(status_code=400, detail=f'连接服务器失败：{msg}')
+
     session_id = uuid.uuid4().hex
     cwd = HOME_DIR
-    host_label = (server.alias or DEFAULT_HOST_LABEL).strip() or DEFAULT_HOST_LABEL
+    host_label = (server.alias or server.ip or DEFAULT_HOST_LABEL).strip() or DEFAULT_HOST_LABEL
 
     data = {
         'session_id': session_id,
@@ -485,6 +956,7 @@ async def create_terminal_session(
         'alias': alias,
         'cwd': cwd,
         'host_label': host_label,
+        'conda_env_name': 'base',
     }
     await _set_session_data(session_id, data)
 
@@ -494,8 +966,8 @@ async def create_terminal_session(
             server_ip=server.ip,
             alias=alias,
             cwd=cwd,
-            prompt=_format_prompt(host_label, cwd),
-            welcome_message='连接成功！',
+            prompt=_format_prompt_with_env(host_label, cwd, 'base'),
+            welcome_message=f'连接成功：{server.ip}',
         )
     )
 
@@ -522,9 +994,10 @@ async def execute_terminal_command(
         raise HTTPException(status_code=400, detail='命令不能为空')
 
     session_data = await _get_session_data(payload.session_id, current_user.id)
+    server_row = await _get_session_server_row(session, current_user, session_data)
     cwd = _normalize_cwd(session_data.get('cwd'))
     host_label = (session_data.get('host_label') or DEFAULT_HOST_LABEL).strip() or DEFAULT_HOST_LABEL
-    prompt_before = _format_prompt(host_label, cwd)
+    prompt_before = _format_prompt_with_env(host_label, cwd, session_data.get('conda_env_name'))
 
     tokens = _split_command(command)
     if not tokens:
@@ -555,7 +1028,7 @@ async def execute_terminal_command(
     if primary == 'cd' and all(op not in command for op in ['&&', '||', ';', '|']):
         target = tokens[1] if len(tokens) > 1 else HOME_DIR
         next_cwd = _resolve_path(cwd, target)
-        if not os.path.isdir(next_cwd):
+        if not await _remote_path_is_dir(server_row, next_cwd):
             msg = f'bash: cd: {target}: No such file or directory'
             return schemas.pspm.TerminalExecuteResponse(
                 status='error',
@@ -576,7 +1049,7 @@ async def execute_terminal_command(
             )
 
         updated = await _update_session_cwd(payload.session_id, current_user.id, next_cwd)
-        next_prompt = _format_prompt(updated.get('host_label') or DEFAULT_HOST_LABEL, next_cwd)
+        next_prompt = _format_prompt_with_env(updated.get('host_label') or DEFAULT_HOST_LABEL, next_cwd, updated.get('conda_env_name'))
         return schemas.pspm.TerminalExecuteResponse(
             data=schemas.pspm.TerminalExecuteResult(
                 session_id=payload.session_id,
@@ -592,31 +1065,89 @@ async def execute_terminal_command(
             )
         )
 
-    process = await asyncio.create_subprocess_shell(
-        f'{CONDA_INIT}{command}',
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=cwd,
-        executable='/bin/bash',
+    if primary == 'conda' and len(tokens) >= 3 and tokens[1].lower() == 'activate' and all(op not in command for op in ['&&', '||', ';', '|']):
+        env_name = tokens[2].strip()
+        check_code, check_out, check_err = await _run_terminal_command_on_server(
+            server_row,
+            f"conda env list | awk '{{print $1}}' | grep -Fx {shlex.quote(env_name)} >/dev/null",
+            cwd,
+            COMMAND_TIMEOUT_SECONDS,
+            'base',
+            False,
+        )
+        if check_code != 0:
+            msg = check_err.strip() or check_out.strip() or f'Conda环境不存在：{env_name}'
+            return schemas.pspm.TerminalExecuteResponse(
+                status='error',
+                code=400,
+                message=msg,
+                data=schemas.pspm.TerminalExecuteResult(
+                    session_id=payload.session_id,
+                    command=command,
+                    cwd=cwd,
+                    prompt_before=prompt_before,
+                    prompt_after=prompt_before,
+                    exit_code=1,
+                    stdout='',
+                    stderr=msg,
+                    blocked=False,
+                    message=msg,
+                ),
+            )
+        async with _terminal_lock:
+            data = _terminal_sessions.get(payload.session_id)
+            if not data or data.get('user_id') != current_user.id:
+                raise HTTPException(status_code=404, detail='会话不存在')
+            data['conda_env_name'] = env_name
+        prompt_after = _format_prompt_with_env(host_label, cwd, env_name)
+        return schemas.pspm.TerminalExecuteResponse(
+            data=schemas.pspm.TerminalExecuteResult(
+                session_id=payload.session_id,
+                command=command,
+                cwd=cwd,
+                prompt_before=prompt_before,
+                prompt_after=prompt_after,
+                exit_code=0,
+                stdout='',
+                stderr='',
+                blocked=False,
+                message='ok',
+            )
+        )
+
+    if primary == 'conda' and len(tokens) >= 2 and tokens[1].lower() == 'deactivate' and all(op not in command for op in ['&&', '||', ';', '|']):
+        async with _terminal_lock:
+            data = _terminal_sessions.get(payload.session_id)
+            if not data or data.get('user_id') != current_user.id:
+                raise HTTPException(status_code=404, detail='会话不存在')
+            data['conda_env_name'] = 'base'
+        prompt_after = _format_prompt_with_env(host_label, cwd, 'base')
+        return schemas.pspm.TerminalExecuteResponse(
+            data=schemas.pspm.TerminalExecuteResult(
+                session_id=payload.session_id,
+                command=command,
+                cwd=cwd,
+                prompt_before=prompt_before,
+                prompt_after=prompt_after,
+                exit_code=0,
+                stdout='',
+                stderr='',
+                blocked=False,
+                message='ok',
+            )
+        )
+
+    detach = str(getattr(payload, 'mode', '') or '').strip().lower() == 'foreground_start'
+    exit_code, stdout, stderr = await _run_terminal_command_on_server(
+        server_row,
+        command,
+        cwd,
+        COMMAND_TIMEOUT_SECONDS,
+        str(session_data.get('conda_env_name') or 'base'),
+        detach,
     )
 
-    timed_out = False
-    try:
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=COMMAND_TIMEOUT_SECONDS)
-    except asyncio.TimeoutError:
-        timed_out = True
-        process.kill()
-        stdout_bytes, stderr_bytes = await process.communicate()
-
-    stdout = (stdout_bytes or b'').decode('utf-8', errors='replace')
-    stderr = (stderr_bytes or b'').decode('utf-8', errors='replace')
-    exit_code = 124 if timed_out else int(process.returncode or 0)
-
-    if timed_out:
-        timeout_msg = f'命令执行超时（>{COMMAND_TIMEOUT_SECONDS}s）'
-        stderr = f'{stderr}\n{timeout_msg}'.strip()
-
-    prompt_after = _format_prompt(host_label, cwd)
+    prompt_after = _format_prompt_with_env(host_label, cwd, session_data.get('conda_env_name'))
     return schemas.pspm.TerminalExecuteResponse(
         data=schemas.pspm.TerminalExecuteResult(
             session_id=payload.session_id,
@@ -650,17 +1181,17 @@ async def complete_terminal_command(
     返回：
     - TerminalCompleteResponse：补全后的命令和候选项列表。
     """
-    _ = session
     session_data = await _get_session_data(payload.session_id, current_user.id)
+    server_row = await _get_session_server_row(session, current_user, session_data)
     cwd = _normalize_cwd(session_data.get('cwd'))
     original = str(payload.command or '')
     prefix, token = _extract_path_token(original)
 
     command_candidates: List[str] = []
     if _is_command_token(prefix, token):
-        command_candidates = await _complete_command_candidates(token)
+        command_candidates = await _complete_command_candidates_on_server(server_row, token)
 
-    candidates = command_candidates if command_candidates else _complete_path_candidates(cwd, token)
+    candidates = command_candidates if command_candidates else await _complete_path_candidates_on_server(server_row, cwd, token)
     if not candidates:
         return schemas.pspm.TerminalCompleteResponse(
             data=schemas.pspm.TerminalCompleteResult(

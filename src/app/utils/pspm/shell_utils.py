@@ -248,7 +248,7 @@ async def _run_server_shell(server_row, command: str, timeout: int = 60) -> tupl
     return 2, '', f'服务器IP格式不合法：{ip}'
 
   password = str(getattr(server_row, 'root_password', '') or '')
-  ssh_opts = '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8'
+  ssh_opts = '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 -o LogLevel=ERROR'
   remote = f'root@{shlex.quote(ip)}'
   quoted_command = shlex.quote(command)
 

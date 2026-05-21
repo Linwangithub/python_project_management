@@ -742,7 +742,7 @@ def _build_project_nginx_server_block(
   """生成项目默认 Nginx server block。"""
   safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', project_name)
   safe_username = re.sub(r'[^a-zA-Z0-9_\-]', '_', username or 'root')
-  frontend_root = str(frontend_root or '').strip() or f'/home/{safe_username}/frontend_dist/{project_name}'
+  frontend_root = str(frontend_root or '').strip() or f'/data/frontend_dist/{project_name}'
   return (
     f"server {{\n"
     f"    listen       {frontend_port};\n"

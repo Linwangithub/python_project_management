@@ -18,8 +18,8 @@ def frontend_dist_base_dir_for_user(current_user, is_root: bool) -> str:
 
   作用：
   - 创建或设置 Nginx 时，Nginx server block 的 `root` 需要指向前端打包目录。
-  - root 用户固定使用 `/root/frontend_dist`。
-  - 普通用户使用 `/home/{username}/frontend_dist`。
+  - 所有用户统一使用 `/data/frontend_dist`，避免 Nginx 访问 `/root` 权限受限。
+  - 普通用户也使用同一公共静态资源根目录，项目名仍作为下一级目录。
 
   返回：
   - 字符串形式的前端打包根目录。
@@ -30,9 +30,7 @@ def frontend_dist_base_dir_for_user(current_user, is_root: bool) -> str:
   """
   username = str(getattr(current_user, 'username', '') or 'root').strip() or 'root'
   safe_username = ''.join(ch if (ch.isalnum() or ch in {'_', '-'}) else '_' for ch in username)
-  if is_root:
-    return '/root/frontend_dist'
-  return f'/home/{safe_username}/frontend_dist'
+  return '/data/frontend_dist'
 
 
 def frontend_root_for_project(current_user, is_root: bool, project_name: str) -> str:
@@ -48,7 +46,7 @@ def frontend_root_for_project(current_user, is_root: bool, project_name: str) ->
   - 在项目表 `frontend_path` 字段中保存该项目的前端打包路径。
 
   返回：
-  - `/root/frontend_dist/{project_name}` 或 `/home/{username}/frontend_dist/{project_name}`。
+  - `/data/frontend_dist/{project_name}`。
   """
   base_dir = frontend_dist_base_dir_for_user(current_user, is_root)
   safe_project_name = str(project_name or '').strip().strip('/')

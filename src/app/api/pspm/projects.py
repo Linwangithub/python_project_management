@@ -1,4 +1,4 @@
-﻿from typing import List
+from typing import List
 
 from fastapi import APIRouter, Depends, Query
 
@@ -21,6 +21,8 @@ from app.services.pspm.project_delete import delete_project_service
 from app.services.pspm.project_runtime import (
   copy_project_service,
   export_project_service,
+  finalize_project_foreground_service,
+  prepare_project_foreground_service,
   start_project_service,
   stop_project_service,
 )
@@ -565,14 +567,14 @@ async def delete_original_project_database(
   return schemas.base.BaseResponse(message='原数据库已删除')
 
 
-@router.put('/start-foreground', name='前台启动', response_model=schemas.base.BaseResponse)
-async def start_foreground(
+@router.get('/start-foreground/prepare', name='prepare_start_foreground', response_model=schemas.base.ItemResponse)
+async def prepare_start_foreground(
   *,
   session: SessionDep,
   current_user=Depends(require_permission('project_management', 'start_foreground')),
   project_id: int = Query(..., description='项目ID'),
 ):
-  """前台启动项目。
+  """准备前台启动参数。
 
   参数：
   - session：数据库会话。
@@ -580,17 +582,74 @@ async def start_foreground(
   - project_id：项目 ID。
 
   作用：
-  - 使用项目设置中的开发启动命令启动项目。
-  - 启动成功后把项目状态更新为运行中。
+  - 只校验项目、服务器、入口文件、Conda 环境和开发启动命令。
+  - 返回前端逐条调用终端执行接口所需的工作目录、环境名、命令和端口。
 
   返回：
-  - `BaseResponse`，message 为启动结果。
+  - ItemResponse.data：前台启动准备信息。
   """
-  message = await start_project_service(session, current_user, project_id, mode='dev', run_in_background=False)
-  return schemas.base.BaseResponse(message=message or '前台启动成功')
+  data = await prepare_project_foreground_service(session, current_user, project_id)
+  return schemas.base.ItemResponse(message='前台启动参数准备完成', data=data)
 
 
-@router.put('/start-background', name='后台启动', response_model=schemas.base.BaseResponse)
+@router.put('/start-foreground/finalize', name='finalize_start_foreground', response_model=schemas.base.ItemResponse)
+async def finalize_start_foreground(
+  *,
+  session: SessionDep,
+  current_user=Depends(require_permission('project_management', 'start_foreground')),
+  payload: schemas.pspm.ProjectForegroundFinalize,
+):
+  """确认前台启动结果。
+
+  参数：
+  - session：数据库会话。
+  - current_user：当前登录用户，需要前台启动权限。
+  - payload：前端真实终端会话启动后返回的项目 ID、PID 和端口。
+
+  作用：
+  - 二次检查进程是否存在、端口是否监听、日志是否有明显错误。
+  - 检查通过后写入 runtime 元数据并把项目状态更新为运行中。
+
+  返回：
+  - ItemResponse.data：最终启动结果。
+  """
+  data = await finalize_project_foreground_service(
+    session,
+    current_user,
+    payload.project_id,
+    payload.pid,
+    payload.port or '',
+    payload.log_file or '',
+  )
+  return schemas.base.ItemResponse(message=(data.get('message') or '前台启动成功'), data=data)
+
+
+@router.put('/start-foreground', name='start_foreground', response_model=schemas.base.ItemResponse)
+async def start_foreground(
+  *,
+  session: SessionDep,
+  current_user=Depends(require_permission('project_management', 'start_foreground')),
+  project_id: int = Query(..., description='项目ID'),
+):
+  """兼容旧版前台启动接口。
+
+  参数：
+  - session：数据库会话。
+  - current_user：当前登录用户，需要前台启动权限。
+  - project_id：项目 ID。
+
+  作用：
+  - 保留旧接口，避免旧前端调用报 404。
+  - 新前端会优先使用 prepare + terminal execute + finalize 的真实终端流程。
+
+  返回：
+  - ItemResponse.data：启动结果。
+  """
+  data = await start_project_service(session, current_user, project_id, mode='dev', run_in_background=False)
+  return schemas.base.ItemResponse(message=(data.get('message') or '前台启动成功'), data=data)
+
+
+@router.put('/start-background', name='start_background', response_model=schemas.base.ItemResponse)
 async def start_background(
   *,
   session: SessionDep,
@@ -611,11 +670,11 @@ async def start_background(
   返回：
   - `BaseResponse`，message 为启动结果。
   """
-  message = await start_project_service(session, current_user, project_id, mode='dev', run_in_background=True)
-  return schemas.base.BaseResponse(message=message or '后台启动成功')
+  data = await start_project_service(session, current_user, project_id, mode='dev', run_in_background=True)
+  return schemas.base.ItemResponse(message=(data.get('message') or '\u540e\u53f0\u542f\u52a8\u6210\u529f'), data=data)
 
 
-@router.put('/deploy-start', name='部署启动', response_model=schemas.base.BaseResponse)
+@router.put('/deploy-start', name='deploy_start', response_model=schemas.base.ItemResponse)
 async def deploy_start(
   *,
   session: SessionDep,
@@ -636,11 +695,11 @@ async def deploy_start(
   返回：
   - `BaseResponse`，message 为启动结果。
   """
-  message = await start_project_service(session, current_user, project_id, mode='deploy', run_in_background=True)
-  return schemas.base.BaseResponse(message=message or '部署启动成功')
+  data = await start_project_service(session, current_user, project_id, mode='deploy', run_in_background=True)
+  return schemas.base.ItemResponse(message=(data.get('message') or '\u90e8\u7f72\u542f\u52a8\u6210\u529f'), data=data)
 
 
-@router.put('/stop', name='停止服务', response_model=schemas.base.BaseResponse)
+@router.put('/stop', name='stop_project', response_model=schemas.base.ItemResponse)
 async def stop_project(
   *,
   session: SessionDep,
@@ -661,8 +720,8 @@ async def stop_project(
   返回：
   - `BaseResponse`，message 为停止结果。
   """
-  message = await stop_project_service(session, current_user, project_id)
-  return schemas.base.BaseResponse(message=message or '停止服务成功')
+  data = await stop_project_service(session, current_user, project_id)
+  return schemas.base.ItemResponse(message=(data.get('message') or '\u505c\u6b62\u670d\u52a1\u6210\u529f'), data=data)
 
 
 @router.post('/copy', name='复制', response_model=schemas.base.BaseResponse)
