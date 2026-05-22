@@ -435,6 +435,7 @@ class CRUDPspmProject(CRUDBase[models.pspm.PspmProject, schemas.pspm.ProjectCrea
                     deploy_start_command=row.deploy_start_command,
                     entry_file_path=row.entry_file_path,
                     status=project_status_to_name(row.status),
+                    service_status=project_status_to_name(row.status),
                     created_at=row.created_at,
                 )
                 for row in rows

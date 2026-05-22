@@ -387,6 +387,37 @@ async def _nginx_conf_contains_project_config(server_row, conf_path: str, fronte
   return code == 0
 
 
+async def inspect_projects_runtime_service(session, current_user, result: schemas.pspm.ProjectItems) -> schemas.pspm.ProjectItems:
+  """Lightweight list runtime inspector.
+
+  The project list must not run the full health check for every row. It only needs
+  service_status and running_port. Full health checks remain button-triggered.
+  """
+  if not result.data:
+    return result
+
+  servers = await _list_allowed_server_rows(session, current_user)
+  server_by_id = {int(getattr(item, 'id', 0) or 0): item for item in servers.data}
+  server_by_ip = {str(getattr(item, 'ip', '') or '').strip(): item for item in servers.data}
+
+  for item in result.data:
+    db_status = str(item.status or '').strip() or '已停止'
+    item.service_status = db_status
+    item.running_port = ''
+    if db_status != '运行中':
+      continue
+
+    server_row = server_by_id.get(int(item.server_id or 0)) or server_by_ip.get(str(item.server_ip or '').strip())
+    if not server_row:
+      continue
+
+    runtime_data = await _inspect_project_runtime(server_row, item)
+    if runtime_data.get('service_status') == '运行中':
+      item.running_port = runtime_data.get('running_port') or ''
+
+  return result
+
+
 async def inspect_projects_health_service(session, current_user, result: schemas.pspm.ProjectItems) -> schemas.pspm.ProjectItems:
   """为项目列表补充服务状态、运行端口和项目健康状态。"""
   if not result.data:
@@ -552,6 +583,7 @@ async def inspect_project_health_service(session, current_user, project_id: int)
     runtime_data = await _inspect_project_runtime(server_row, item)
     item.service_status = runtime_data.get('service_status') or '已停止'
     item.running_port = runtime_data.get('running_port') or ''
+    await crud.projects.update_status(session, project_id=project_id, running=item.service_status == '运行中')
     if item.backend_path and not await _server_path_exists(server_row, item.backend_path):
       problems.append('项目目录不存在')
     if item.conda_env_name and not await _server_conda_env_exists(server_row, item.conda_env_name):

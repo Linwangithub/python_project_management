@@ -32,6 +32,10 @@ CONDA_INIT = 'source /root/miniforge3/etc/profile.d/conda.sh >/dev/null 2>&1 || 
 _terminal_sessions: Dict[str, Dict[str, Any]] = {}
 _terminal_lock = asyncio.Lock()
 
+_ws_terminal_sessions: Dict[str, Dict[str, Any]] = {}
+_ws_terminal_lock = asyncio.Lock()
+WS_OUTPUT_BUFFER_LIMIT = 800
+
 ANSI_PATTERN = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
 
 
@@ -743,23 +747,63 @@ exit 23
     await _safe_send_json(websocket, _terminal_ws_response('foreground_pending', {'message': message}))
 
 
-@router.websocket('/ws', name='pspm_terminal_ws')
-async def terminal_websocket(
-    websocket: WebSocket,
-    current_user: CurrentWSUser,
-):
-    """Interactive terminal implemented with one isolated WebSocket + PTY per tab."""
-    await websocket.accept(subprotocol='pspm-terminal')
-    process: subprocess.Popen | None = None
-    master_fd: int | None = None
-    reader_task: asyncio.Task | None = None
-    watcher_task: asyncio.Task | None = None
-    server_row: models.pspm.PspmServer | None = None
 
-    async def reader_loop() -> None:
-        """Read PTY output and stream it back to the browser."""
-        assert master_fd is not None
+async def _broadcast_ws_terminal_output(session_id: str, text: str) -> None:
+    """把 PTY 输出写入会话缓冲区，并推送给当前已连接的浏览器客户端。
+
+    参数：
+    - session_id：后端 WebSocket 终端会话 ID，前端刷新后也会用它重连。
+    - text：从 PTY 读取到的原始输出文本。
+
+    作用：
+    - 即使浏览器临时刷新，后台 reader 仍会持续读取 PTY，避免远程程序输出阻塞。
+    - 最近输出会保存在内存缓冲区，便于后续扩展断线重放。
+    """
+    if not text:
+        return
+    async with _ws_terminal_lock:
+        state = _ws_terminal_sessions.get(session_id)
+        if not state:
+            return
+        buffer = state.setdefault('output_buffer', [])
+        buffer.append(text)
+        if len(buffer) > WS_OUTPUT_BUFFER_LIMIT:
+            del buffer[:-WS_OUTPUT_BUFFER_LIMIT]
+        clients = list(state.get('clients') or [])
+
+    dead_clients = []
+    for client in clients:
+        ok = await _safe_send_json(client, _terminal_ws_response('output', {'text': text}))
+        if not ok:
+            dead_clients.append(client)
+
+    if dead_clients:
+        async with _ws_terminal_lock:
+            state = _ws_terminal_sessions.get(session_id)
+            if state:
+                state['clients'] = [item for item in (state.get('clients') or []) if item not in dead_clients]
+
+
+async def _ws_terminal_reader_loop(session_id: str) -> None:
+    """持续读取某个后端终端会话的 PTY 输出。
+
+    参数：
+    - session_id：后端 WebSocket 终端会话 ID。
+
+    作用：
+    - reader 生命周期跟后端终端会话绑定，而不是跟某一个 WebSocket 连接绑定。
+    - 页面刷新导致 WebSocket 短暂断开时，reader 不会停止，前台服务输出不会丢失或阻塞。
+    """
+    try:
         while True:
+            async with _ws_terminal_lock:
+                state = _ws_terminal_sessions.get(session_id)
+                if not state:
+                    break
+                master_fd = state.get('master_fd')
+                process = state.get('process')
+            if master_fd is None:
+                break
             try:
                 ready, _w, _e = await asyncio.to_thread(select_module.select, [master_fd], [], [], 0.2)
                 if not ready:
@@ -769,30 +813,36 @@ async def terminal_websocket(
                 data = os.read(master_fd, 4096)
                 if not data:
                     break
-                text = data.decode('utf-8', errors='replace')
-                ok = await _safe_send_json(websocket, _terminal_ws_response('output', {'text': text}))
-                if not ok:
-                    break
+                await _broadcast_ws_terminal_output(session_id, data.decode('utf-8', errors='replace'))
             except OSError:
                 break
             except Exception as exc:
-                await _safe_send_json(websocket, _terminal_ws_response('error', {'message': f'\u8bfb\u53d6\u7ec8\u7aef\u8f93\u51fa\u5931\u8d25\uff1a{exc}'}))
+                await _broadcast_ws_terminal_output(session_id, f'\n读取终端输出失败：{exc}\n')
                 break
+    finally:
+        async with _ws_terminal_lock:
+            state = _ws_terminal_sessions.get(session_id)
+            if state:
+                state['reader_task'] = None
+                state['alive'] = False
 
+
+async def _create_ws_terminal_session(current_user: schemas.users.Data, server_ip: str, alias: str) -> Dict[str, Any]:
+    """创建一个可重连的后端 WebSocket 终端会话。
+
+    参数：
+    - current_user：当前登录用户，用于权限和会话归属校验。
+    - server_ip：业务服务器 IP。
+    - alias：前端展示的终端标签名。
+
+    返回：
+    - Dict[str, Any]：包含 PTY、进程、业务服务器等信息的会话状态。
+    """
+    server_row = await _get_ws_allowed_server_by_ip(current_user, server_ip)
+    command = await _build_terminal_process_command(server_row)
+    master_fd, slave_fd = pty.openpty()
+    process: subprocess.Popen | None = None
     try:
-        first = await websocket.receive_json()
-        if first.get('type') != 'open':
-            await websocket.send_json(_terminal_ws_response('error', {'message': '\u7ec8\u7aef\u9996\u5305\u5fc5\u987b\u662f open'}))
-            return
-        server_ip = str(first.get('server_ip') or '').strip()
-        alias = str(first.get('alias') or '').strip() or 'terminal'
-        if not server_ip:
-            await websocket.send_json(_terminal_ws_response('error', {'message': '\u670d\u52a1\u5668IP\u4e0d\u80fd\u4e3a\u7a7a'}))
-            return
-
-        server_row = await _get_ws_allowed_server_by_ip(current_user, server_ip)
-        command = await _build_terminal_process_command(server_row)
-        master_fd, slave_fd = pty.openpty()
         process = subprocess.Popen(
             command,
             stdin=slave_fd,
@@ -801,18 +851,215 @@ async def terminal_websocket(
             start_new_session=True,
             close_fds=True,
         )
-        os.close(slave_fd)
-        reader_task = asyncio.create_task(reader_loop())
+    finally:
+        try:
+            os.close(slave_fd)
+        except Exception:
+            pass
+    if process is None:
+        try:
+            os.close(master_fd)
+        except Exception:
+            pass
+        raise WebSocketException(code=status.WS_1011_INTERNAL_ERROR, reason='终端进程创建失败')
+
+    session_id = uuid.uuid4().hex
+    state: Dict[str, Any] = {
+        'session_id': session_id,
+        'user_id': current_user.id,
+        'server_ip': server_ip,
+        'alias': alias,
+        'server_row': server_row,
+        'process': process,
+        'master_fd': master_fd,
+        'clients': [],
+        'watcher_tasks': [],
+        'output_buffer': [],
+        'reader_task': None,
+        'alive': True,
+    }
+    async with _ws_terminal_lock:
+        _ws_terminal_sessions[session_id] = state
+        state['reader_task'] = asyncio.create_task(_ws_terminal_reader_loop(session_id))
+    return state
+
+
+async def _get_or_create_ws_terminal_session(
+    current_user: schemas.users.Data,
+    server_ip: str,
+    alias: str,
+    requested_session_id: str,
+) -> tuple[Dict[str, Any], bool]:
+    """按前端传入的 session_id 重连，找不到时创建新会话。
+
+    参数：
+    - current_user：当前登录用户。
+    - server_ip：业务服务器 IP。
+    - alias：终端标签。
+    - requested_session_id：前端本地保存的后端终端会话 ID。
+
+    返回：
+    - tuple[Dict[str, Any], bool]：会话状态，以及是否为重连。
+    """
+    safe_session_id = str(requested_session_id or '').strip()
+    if safe_session_id:
+        async with _ws_terminal_lock:
+            state = _ws_terminal_sessions.get(safe_session_id)
+        if state and state.get('user_id') == current_user.id:
+            process = state.get('process')
+            if process and process.poll() is None:
+                return state, True
+            await _close_ws_terminal_session(safe_session_id, current_user.id)
+    return await _create_ws_terminal_session(current_user, server_ip, alias), False
+
+
+async def _attach_ws_terminal_client(session_id: str, websocket: WebSocket) -> None:
+    """把当前 WebSocket 连接挂到后端终端会话上。"""
+    async with _ws_terminal_lock:
+        state = _ws_terminal_sessions.get(session_id)
+        if not state:
+            return
+        clients = state.setdefault('clients', [])
+        if websocket not in clients:
+            clients.append(websocket)
+
+
+async def _detach_ws_terminal_client(session_id: str, websocket: WebSocket) -> None:
+    """把当前 WebSocket 连接从后端终端会话上摘除，但不关闭终端进程。"""
+    async with _ws_terminal_lock:
+        state = _ws_terminal_sessions.get(session_id)
+        if not state:
+            return
+        state['clients'] = [item for item in (state.get('clients') or []) if item is not websocket]
+
+
+async def _track_ws_watcher_task(session_id: str, task: asyncio.Task) -> None:
+    """记录前台启动端口检测任务，避免 WebSocket 断开时任务被取消。"""
+    async with _ws_terminal_lock:
+        state = _ws_terminal_sessions.get(session_id)
+        if state:
+            state.setdefault('watcher_tasks', []).append(task)
+
+    def _forget(done_task: asyncio.Task) -> None:
+        async def _remove() -> None:
+            async with _ws_terminal_lock:
+                state = _ws_terminal_sessions.get(session_id)
+                if state:
+                    state['watcher_tasks'] = [item for item in (state.get('watcher_tasks') or []) if item is not done_task]
+        asyncio.create_task(_remove())
+
+    task.add_done_callback(_forget)
+
+
+async def _close_ws_terminal_session(session_id: str, user_id: int | None = None) -> bool:
+    """显式关闭后端 WebSocket 终端会话。
+
+    参数：
+    - session_id：要关闭的后端终端会话 ID。
+    - user_id：当前用户 ID；传入时会校验会话归属。
+
+    作用：
+    - 只有用户点击关闭终端窗口或调用关闭接口时才会执行。
+    - 会关闭浏览器连接、取消 reader/watcher、杀掉 PTY/SSH 进程并释放 FD。
+    """
+    async with _ws_terminal_lock:
+        state = _ws_terminal_sessions.get(session_id)
+        if not state or (user_id is not None and state.get('user_id') != user_id):
+            return False
+        _ws_terminal_sessions.pop(session_id, None)
+        clients = list(state.get('clients') or [])
+        watcher_tasks = list(state.get('watcher_tasks') or [])
+        reader_task = state.get('reader_task')
+        process = state.get('process')
+        master_fd = state.get('master_fd')
+
+    for client in clients:
+        try:
+            await client.send_json(_terminal_ws_response('closed', {'message': '终端会话已关闭'}))
+            await client.close()
+        except Exception:
+            pass
+
+    for task in watcher_tasks:
+        if task and not task.done():
+            task.cancel()
+    if reader_task and not reader_task.done():
+        reader_task.cancel()
+        try:
+            await reader_task
+        except BaseException:
+            pass
+
+    if process and process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGHUP)
+        except Exception:
+            try:
+                process.terminate()
+            except Exception:
+                pass
+    if master_fd is not None:
+        try:
+            os.close(master_fd)
+        except Exception:
+            pass
+    return True
+
+
+@router.websocket('/ws', name='pspm_terminal_ws')
+async def terminal_websocket(
+    websocket: WebSocket,
+    current_user: CurrentWSUser,
+):
+    """提供可重连的交互式 WebSocket 终端。
+
+    设计说明：
+    - 一个后端终端会话对应一个 PTY/SSH 进程，可被浏览器刷新后的新 WebSocket 重连。
+    - 普通网络断开、页面刷新不会杀掉 PTY/SSH 进程，也不会取消前台启动端口检测任务。
+    - 只有前端明确发送 `type=close` 或调用关闭接口时，才真正关闭终端会话。
+    """
+    await websocket.accept(subprotocol='pspm-terminal')
+    session_id = ''
+    explicit_close = False
+
+    try:
+        first = await websocket.receive_json()
+        if first.get('type') != 'open':
+            await websocket.send_json(_terminal_ws_response('error', {'message': '终端首包必须是 open'}))
+            return
+
+        server_ip = str(first.get('server_ip') or '').strip()
+        alias = str(first.get('alias') or '').strip() or 'terminal'
+        requested_session_id = str(first.get('session_id') or first.get('remote_session_id') or '').strip()
+        if not server_ip:
+            await websocket.send_json(_terminal_ws_response('error', {'message': '服务器IP不能为空'}))
+            return
+
+        state, reconnected = await _get_or_create_ws_terminal_session(current_user, server_ip, alias, requested_session_id)
+        session_id = str(state.get('session_id') or '')
+        await _attach_ws_terminal_client(session_id, websocket)
+        process = state.get('process')
         await websocket.send_json(_terminal_ws_response('ready', {
-            'session_id': uuid.uuid4().hex,
-            'server_ip': server_ip,
-            'alias': alias,
-            'pid': process.pid,
+            'session_id': session_id,
+            'server_ip': state.get('server_ip') or server_ip,
+            'alias': state.get('alias') or alias,
+            'pid': getattr(process, 'pid', None),
+            'reconnected': reconnected,
         }))
 
         while True:
             data = await websocket.receive_json()
             msg_type = str(data.get('type') or '').strip()
+
+            async with _ws_terminal_lock:
+                state = _ws_terminal_sessions.get(session_id)
+            if not state:
+                await websocket.send_json(_terminal_ws_response('closed', {'message': '终端会话已关闭'}))
+                break
+
+            master_fd = state.get('master_fd')
+            server_row = state.get('server_row')
+
             if msg_type == 'input':
                 text = str(data.get('text') or '')
                 if master_fd is not None:
@@ -824,7 +1071,7 @@ async def terminal_websocket(
                 conda_env_name = str(data.get('conda_env_name') or '').strip()
                 command_text = str(data.get('command') or '').strip()
                 if not command_text:
-                    await websocket.send_json(_terminal_ws_response('error', {'message': '\u6682\u65e0\u914d\u7f6e\u542f\u52a8\u547d\u4ee4'}))
+                    await websocket.send_json(_terminal_ws_response('error', {'message': '暂无配置启动命令'}))
                     continue
                 if master_fd is not None:
                     if work_dir:
@@ -834,9 +1081,7 @@ async def terminal_websocket(
                         _write_pty(master_fd, f"conda activate {shlex.quote(conda_env_name)}\n")
                         await asyncio.sleep(0.2)
                     _write_pty(master_fd, f"{command_text}\n")
-                    await websocket.send_json(_terminal_ws_response('foreground_pending', {'message': '\u542f\u52a8\u547d\u4ee4\u5df2\u8fdb\u5165\u524d\u53f0\u8fd0\u884c\uff0c\u6b63\u5728\u7b49\u5f85\u7aef\u53e3\u76d1\u542c'}))
-                    if watcher_task and not watcher_task.done():
-                        watcher_task.cancel()
+                    await websocket.send_json(_terminal_ws_response('foreground_pending', {'message': '启动命令已进入前台运行，正在等待端口监听'}))
                     if server_row and project_id:
                         watcher_task = asyncio.create_task(_watch_foreground_port_ready(
                             websocket=websocket,
@@ -844,9 +1089,11 @@ async def terminal_websocket(
                             project_id=project_id,
                             port=port,
                         ))
+                        await _track_ws_watcher_task(session_id, watcher_task)
             elif msg_type == 'resize':
                 continue
             elif msg_type == 'close':
+                explicit_close = True
                 break
     except WebSocketDisconnect:
         pass
@@ -854,30 +1101,14 @@ async def terminal_websocket(
         raise
     except Exception as exc:
         try:
-            await websocket.send_json(_terminal_ws_response('error', {'message': f'\u7ec8\u7aef\u8fde\u63a5\u5f02\u5e38\uff1a{exc}'}))
+            await websocket.send_json(_terminal_ws_response('error', {'message': f'终端连接异常：{exc}'}))
         except Exception:
             pass
     finally:
-        for task in [watcher_task, reader_task]:
-            if task:
-                task.cancel()
-                try:
-                    await task
-                except BaseException:
-                    pass
-        if process and process.poll() is None:
-            try:
-                os.killpg(process.pid, signal.SIGHUP)
-            except Exception:
-                try:
-                    process.terminate()
-                except Exception:
-                    pass
-        if master_fd is not None:
-            try:
-                os.close(master_fd)
-            except Exception:
-                pass
+        if session_id:
+            await _detach_ws_terminal_client(session_id, websocket)
+        if explicit_close and session_id:
+            await _close_ws_terminal_session(session_id, current_user.id)
         try:
             await websocket.close()
         except Exception:
@@ -1244,7 +1475,8 @@ async def close_terminal_session(
     - BaseResponse：关闭成功提示。
     """
     _ = session
-    removed = await _remove_session(payload.session_id, current_user.id)
-    if not removed:
+    removed_legacy = await _remove_session(payload.session_id, current_user.id)
+    removed_ws = await _close_ws_terminal_session(payload.session_id, current_user.id)
+    if not removed_legacy and not removed_ws:
         raise HTTPException(status_code=404, detail='会话不存在')
     return schemas.base.BaseResponse(message='会话已关闭')

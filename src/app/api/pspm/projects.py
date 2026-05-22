@@ -13,6 +13,7 @@ from app.services.pspm.project_checks import (
   list_project_conda_envs_service,
   list_project_entry_path_children_service,
   inspect_projects_health_service,
+  inspect_projects_runtime_service,
   inspect_project_health_service,
 )
 from app.services.pspm.project_create import create_project_real_service, create_project_record_service
@@ -109,6 +110,7 @@ async def list_projects(
     page_size=page_size,
   )
   # 列表接口只返回基础字段，项目健康状态改为点击按钮后按需检测，避免刷新页面时批量检测拖慢或报错。
+  result = await inspect_projects_runtime_service(session, current_user, result)
   return schemas.pspm.ProjectItemsResponse(data=result)
 
 
