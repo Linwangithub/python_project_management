@@ -451,6 +451,18 @@ def _build_stop_terminal_steps(pid: str, meta_file: str, pid_file: str, output: 
   ]
 
 
+def _strip_internal_runtime_markers(text: str) -> str:
+  visible_lines = []
+  for line in str(text or '').splitlines():
+    value = line.strip()
+    if not value or value.startswith('PSPM_'):
+      continue
+    if visible_lines and visible_lines[-1] == value:
+      continue
+    visible_lines.append(value)
+  return '\n'.join(visible_lines).strip()
+
+
 async def _start_project_process(
   *,
   server_row,
@@ -634,13 +646,13 @@ echo "{MSG_STOPPED}\uff1aPID=$pid"
   code, out, err = await _run_server_shell(server_row, _safe_project_shell_script(script), timeout=30)
   pid = _extract_marked_value(out, 'PSPM_PID')
   if code in {21, 22, 23, 24}:
-    message = (out or err or MSG_NOT_RUNNING).strip()
+    message = _strip_internal_runtime_markers(out or err or MSG_NOT_RUNNING)
   elif code in {25, 26}:
-    raise HTTPException(status_code=400, detail=(out or err or MSG_SECURITY_FAIL).strip())
+    raise HTTPException(status_code=400, detail=_strip_internal_runtime_markers(out or err or MSG_SECURITY_FAIL))
   elif code != 0:
-    raise HTTPException(status_code=500, detail=f'{MSG_STOP_FAIL}\uff1a{(err or out or "unknown error").strip()}')
+    raise HTTPException(status_code=500, detail=f'{MSG_STOP_FAIL}\uff1a{_strip_internal_runtime_markers(err or out or "unknown error")}')
   else:
-    message = (out or MSG_STOP_SUCCESS).strip()
+    message = _strip_internal_runtime_markers(out or MSG_STOP_SUCCESS)
 
   return {
     'message': message,

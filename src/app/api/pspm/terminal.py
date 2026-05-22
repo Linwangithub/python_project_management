@@ -1,18 +1,26 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
+import posixpath
 import pty
 import re
 import select as select_module
+import secrets
 import shlex
 import signal
 import subprocess
+import tempfile
+import time
 import uuid
+from types import SimpleNamespace
 from typing import Any, Dict, List, Tuple
+from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, WebSocketException, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect, WebSocketException, status
+from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import select
 
 from app import crud, models, schemas
@@ -31,6 +39,9 @@ CONDA_INIT = 'source /root/miniforge3/etc/profile.d/conda.sh >/dev/null 2>&1 || 
 
 _terminal_sessions: Dict[str, Dict[str, Any]] = {}
 _terminal_lock = asyncio.Lock()
+_terminal_download_tickets: Dict[str, Dict[str, Any]] = {}
+_terminal_download_ticket_lock = asyncio.Lock()
+DOWNLOAD_TICKET_TTL_SECONDS = 300
 
 _ws_terminal_sessions: Dict[str, Dict[str, Any]] = {}
 _ws_terminal_lock = asyncio.Lock()
@@ -182,6 +193,28 @@ def _resolve_completion_base(cwd: str, token: str) -> Tuple[str, str]:
         base_dir = '/'
     return os.path.normpath(base_dir), base_name
 
+
+def _to_completion_display(cwd: str, token: str, abs_path: str, is_dir: bool) -> str:
+    """Return a shell-like completion candidate relative to the token being completed."""
+    normalized = os.path.normpath(abs_path)
+    if token.startswith('/'):
+        display = normalized
+    elif token.startswith('~/'):
+        home_path = f'{HOME_DIR}/'
+        if normalized.startswith(home_path):
+            display = f'~/{normalized[len(home_path):]}'
+        else:
+            display = normalized
+    else:
+        base_dir, _base_name = _resolve_completion_base(cwd, token)
+        name = os.path.basename(normalized.rstrip('/'))
+        token_dir = ''
+        if '/' in token:
+            token_dir = token.rsplit('/', 1)[0].rstrip('/')
+        display = f'{token_dir}/{name}' if token_dir else name
+    if is_dir and not display.endswith('/'):
+        display = f'{display}/'
+    return display
 
 def _to_display_path(abs_path: str) -> str:
     """把绝对路径转换为终端中更友好的展示路径。
@@ -471,15 +504,19 @@ async def _complete_command_candidates_on_server(server_row, token: str) -> List
 
 
 async def _complete_path_candidates_on_server(server_row, cwd: str, token: str) -> List[str]:
-    """在终端会话对应服务器上查询路径补全候选项。"""
+    """Return a shell-like completion candidate relative to the current input token."""
     base_dir, base_name = _resolve_completion_base(cwd, token)
     script = (
         f'base={shlex.quote(base_dir)}; '
+        f'prefix={shlex.quote(base_name)}; '
         'if [ -d "$base" ]; then '
-        'find "$base" -maxdepth 1 -mindepth 1 -printf "%p\\t%y\\n" 2>/dev/null; '
+        'for item in "$base"/"$prefix"*; do '
+        '  [ -e "$item" ] || continue; '
+        '  [ -d "$item" ] && printf "d\t%s\n" "$item" || printf "f\t%s\n" "$item"; '
+        'done | head -n 200; '
         'fi'
     )
-    code, out, _err = await _run_server_shell(server_row, _wrap_remote_bash(script), timeout=10)
+    code, out, _err = await _run_server_shell(server_row, _wrap_remote_bash(script), timeout=3)
     if code != 0:
         return []
 
@@ -488,16 +525,12 @@ async def _complete_path_candidates_on_server(server_row, cwd: str, token: str) 
         raw = (line or '').strip()
         if not raw or '\t' not in raw:
             continue
-        abs_path, kind = raw.rsplit('\t', 1)
+        kind, abs_path = raw.split('\t', 1)
         name = os.path.basename(abs_path.rstrip('/'))
         if not name.startswith(base_name):
             continue
-        display = _to_display_path(abs_path)
-        if kind == 'd' and not display.endswith('/'):
-            display = f'{display}/'
-        candidates.append(display)
+        candidates.append(_to_completion_display(cwd, token, abs_path, kind == 'd'))
     return sorted(set(candidates))
-
 
 async def _set_session_data(session_id: str, data: Dict[str, Any]) -> None:
     """写入内存终端会话数据。
@@ -566,6 +599,136 @@ async def _remove_session(session_id: str, user_id: int) -> bool:
             return False
         _terminal_sessions.pop(session_id, None)
         return True
+
+
+async def _get_transfer_session_context(
+    session: SessionDep,
+    current_user: schemas.users.Data,
+    session_id: str,
+) -> tuple[models.pspm.PspmServer, str]:
+    """Resolve a legacy or WebSocket terminal session for file transfer."""
+    try:
+        session_data = await _get_session_data(session_id, current_user.id)
+        server_row = await _get_session_server_row(session, current_user, session_data)
+        return server_row, _normalize_cwd(session_data.get('cwd'))
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+
+    async with _ws_terminal_lock:
+        state = _ws_terminal_sessions.get(session_id)
+    if not state or state.get('user_id') != current_user.id:
+        raise HTTPException(status_code=404, detail='会话不存在')
+
+    server_row = state.get('server_row')
+    if not server_row:
+        raise HTTPException(status_code=404, detail='会话不存在')
+    cwd = str(state.get('cwd') or state.get('foreground_cwd') or HOME_DIR)
+    return server_row, _normalize_cwd(cwd)
+
+
+async def _get_terminal_session_context(
+    session: SessionDep,
+    current_user: schemas.users.Data,
+    session_id: str,
+) -> tuple[models.pspm.PspmServer, str, str]:
+    """Resolve session context for command completion and file operations."""
+    try:
+        session_data = await _get_session_data(session_id, current_user.id)
+        server_row = await _get_session_server_row(session, current_user, session_data)
+        return server_row, _normalize_cwd(session_data.get('cwd')), str(session_data.get('conda_env_name') or 'base')
+    except HTTPException as exc:
+        if exc.status_code != 404:
+            raise
+
+    async with _ws_terminal_lock:
+        state = _ws_terminal_sessions.get(session_id)
+    if not state or state.get('user_id') != current_user.id:
+        raise HTTPException(status_code=404, detail='会话不存在')
+    server_row = state.get('server_row')
+    if not server_row:
+        raise HTTPException(status_code=404, detail='会话不存在')
+    cwd = str(state.get('cwd') or state.get('foreground_cwd') or HOME_DIR)
+    conda_env_name = str(state.get('conda_env_name') or state.get('foreground_conda_env_name') or 'base')
+    return server_row, _normalize_cwd(cwd), conda_env_name
+
+
+async def _build_terminal_completion_result(server_row, cwd: str, session_id: str, command: str) -> Dict[str, Any]:
+    """Build the Tab completion result from the current terminal session context."""
+    original = str(command or '')
+    prefix, token = _extract_path_token(original)
+
+    command_candidates: List[str] = []
+    if _is_command_token(prefix, token):
+        command_candidates = await _complete_command_candidates_on_server(server_row, token)
+
+    candidates = command_candidates if command_candidates else await _complete_path_candidates_on_server(server_row, cwd, token)
+    if not candidates:
+        return {
+            'session_id': session_id,
+            'requested_command': original,
+            'original_command': original,
+            'completed_command': original,
+            'candidates': [],
+            'cwd': cwd,
+            'message': 'no_match',
+        }
+
+    if len(candidates) == 1:
+        completed = f'{prefix}{candidates[0]}'
+        if command_candidates:
+            completed = f'{completed} '
+    else:
+        cp = _common_prefix(candidates)
+        completed = f'{prefix}{cp}' if cp and cp != token else original
+
+    return {
+        'session_id': session_id,
+        'requested_command': original,
+        'original_command': original,
+        'completed_command': completed,
+        'candidates': candidates,
+        'cwd': cwd,
+        'message': 'ok',
+    }
+
+def _get_transfer_root(current_user: schemas.users.Data) -> str:
+    """Return the allowed root directory for the download browser."""
+    username = str(getattr(current_user, 'username', '') or '').strip()
+    is_root = int(getattr(current_user, 'id', 0) or 0) == 1 or username == 'root'
+    if is_root:
+        return HOME_DIR
+    safe_username = re.sub(r'[^A-Za-z0-9._-]+', '', username)
+    return f'/home/{safe_username or username or "user"}'
+
+
+def _ensure_under_transfer_root(path: str, root: str) -> str:
+    """Ensure a transfer path stays under the allowed root directory."""
+    normalized = _normalize_cwd(path)
+    normalized_root = _normalize_cwd(root)
+    if normalized == normalized_root or normalized.startswith(f'{normalized_root}/'):
+        return normalized
+    raise HTTPException(status_code=400, detail='Path is outside the allowed download root')
+
+
+def _resolve_transfer_browser_target(root: str, target_path: str | None) -> str:
+    """Resolve the download browser target and clamp it under the allowed root."""
+    raw = str(target_path or '').strip()
+    if not raw:
+        return _normalize_cwd(root)
+    return _ensure_under_transfer_root(_resolve_path(_normalize_cwd(root), raw), root)
+
+async def _find_ws_terminal_session_id_by_pid(user_id: int, pid: str) -> str:
+    """Find a WebSocket terminal session by its PTY/SSH process PID."""
+    target_pid = str(pid or '').strip()
+    if not target_pid:
+        return ''
+    async with _ws_terminal_lock:
+        for session_id, state in _ws_terminal_sessions.items():
+            process = state.get('process')
+            if state.get('user_id') == user_id and process and str(getattr(process, 'pid', '') or '') == target_pid:
+                return session_id
+    return ''
 
 
 
@@ -689,6 +852,25 @@ async def _mark_project_running(project_id: int) -> None:
         await crud.projects.update_status(db, project_id=project_id, running=True)
 
 
+async def _mark_project_stopped(project_id: int) -> None:
+    """Persist that a project is stopped."""
+    if not project_id:
+        return
+    async with get_session() as db:
+        await crud.projects.update_status(db, project_id=project_id, running=False)
+
+
+async def _set_ws_foreground_state(session_id: str, project_id: int, pid: str, port: str) -> None:
+    """Remember which project is bound to a foreground terminal session."""
+    async with _ws_terminal_lock:
+        state = _ws_terminal_sessions.get(session_id)
+        if not state:
+            return
+        state['foreground_project_id'] = int(project_id or 0)
+        state['foreground_pid'] = str(pid or '').strip()
+        state['foreground_port'] = str(port or '').strip()
+
+
 async def _safe_send_json(websocket: WebSocket, payload: Dict[str, Any]) -> bool:
     """Send a JSON message and return False if the socket is already closed."""
     try:
@@ -705,6 +887,7 @@ def _write_pty(master_fd: int, text: str) -> None:
 
 async def _watch_foreground_port_ready(
     *,
+    session_id: str,
     websocket: WebSocket,
     server_row: models.pspm.PspmServer,
     project_id: int,
@@ -712,6 +895,10 @@ async def _watch_foreground_port_ready(
     wait_seconds: int = 30,
 ) -> None:
     """Use a side shell to detect when the foreground service starts listening."""
+    async with _ws_terminal_lock:
+        state = _ws_terminal_sessions.get(session_id)
+        session_cwd = str(state.get('foreground_cwd') or HOME_DIR) if state else HOME_DIR
+        session_conda_env = str(state.get('foreground_conda_env_name') or 'base') if state else 'base'
     safe_port = shlex.quote(str(port or '').strip())
     if not str(port or '').strip():
         await _safe_send_json(websocket, _terminal_ws_response('foreground_pending', {'message': '\u542f\u52a8\u547d\u4ee4\u5df2\u8fdb\u5165\u524d\u53f0\u8fd0\u884c\uff0c\u672a\u914d\u7f6e\u7aef\u53e3\uff0c\u8bf7\u4ee5\u7ec8\u7aef\u8f93\u51fa\u4e3a\u51c6'}))
@@ -737,10 +924,13 @@ exit 23
     if ready and pid:
         await _write_project_runtime_meta(server_row=server_row, project_id=project_id, pid=pid, port=port, mode='dev')
         await _mark_project_running(project_id)
+        await _set_ws_foreground_state(session_id, project_id, pid, port)
         await _safe_send_json(websocket, _terminal_ws_response('foreground_started', {
             'project_id': project_id,
             'pid': pid,
             'port': port,
+            'cwd': session_cwd,
+            'conda_env_name': session_conda_env,
         }))
         return
     message = (err or out or '').strip() or '\u7b49\u5f85\u7aef\u53e3\u76d1\u542c\u8d85\u65f6\uff0c\u8bf7\u67e5\u770b\u7ec8\u7aef\u8f93\u51fa'
@@ -877,6 +1067,11 @@ async def _create_ws_terminal_session(current_user: schemas.users.Data, server_i
         'output_buffer': [],
         'reader_task': None,
         'alive': True,
+        'cwd': HOME_DIR,
+        'conda_env_name': 'base',
+        'foreground_project_id': 0,
+        'foreground_pid': '',
+        'foreground_port': '',
     }
     async with _ws_terminal_lock:
         _ws_terminal_sessions[session_id] = state
@@ -972,10 +1167,14 @@ async def _close_ws_terminal_session(session_id: str, user_id: int | None = None
         reader_task = state.get('reader_task')
         process = state.get('process')
         master_fd = state.get('master_fd')
+        foreground_project_id = int(state.get('foreground_project_id') or 0)
 
     for client in clients:
         try:
-            await client.send_json(_terminal_ws_response('closed', {'message': '终端会话已关闭'}))
+            await client.send_json(_terminal_ws_response('closed', {
+                'message': '终端会话已关闭',
+                'project_id': foreground_project_id,
+            }))
             await client.close()
         except Exception:
             pass
@@ -1003,6 +1202,8 @@ async def _close_ws_terminal_session(session_id: str, user_id: int | None = None
             os.close(master_fd)
         except Exception:
             pass
+    if foreground_project_id:
+        await _mark_project_stopped(foreground_project_id)
     return True
 
 
@@ -1045,6 +1246,8 @@ async def terminal_websocket(
             'alias': state.get('alias') or alias,
             'pid': getattr(process, 'pid', None),
             'reconnected': reconnected,
+            'cwd': state.get('cwd') or HOME_DIR,
+            'conda_env_name': state.get('conda_env_name') or 'base',
         }))
 
         while True:
@@ -1062,6 +1265,22 @@ async def terminal_websocket(
 
             if msg_type == 'input':
                 text = str(data.get('text') or '')
+                stripped_text = text.strip()
+                if stripped_text.startswith('cd '):
+                    async with _ws_terminal_lock:
+                        active_state = _ws_terminal_sessions.get(session_id)
+                        if active_state:
+                            active_state['cwd'] = _resolve_path(str(active_state.get('cwd') or HOME_DIR), stripped_text[3:].strip())
+                elif stripped_text.startswith('conda activate '):
+                    async with _ws_terminal_lock:
+                        active_state = _ws_terminal_sessions.get(session_id)
+                        if active_state:
+                            active_state['conda_env_name'] = stripped_text.split()[-1] if stripped_text.split() else 'base'
+                elif stripped_text == 'conda deactivate':
+                    async with _ws_terminal_lock:
+                        active_state = _ws_terminal_sessions.get(session_id)
+                        if active_state:
+                            active_state['conda_env_name'] = 'base'
                 if master_fd is not None:
                     _write_pty(master_fd, text)
             elif msg_type == 'run_foreground':
@@ -1081,15 +1300,34 @@ async def terminal_websocket(
                         _write_pty(master_fd, f"conda activate {shlex.quote(conda_env_name)}\n")
                         await asyncio.sleep(0.2)
                     _write_pty(master_fd, f"{command_text}\n")
-                    await websocket.send_json(_terminal_ws_response('foreground_pending', {'message': '启动命令已进入前台运行，正在等待端口监听'}))
+                    async with _ws_terminal_lock:
+                        active_state = _ws_terminal_sessions.get(session_id)
+                        if active_state:
+                            active_state['foreground_project_id'] = int(project_id or 0)
+                            active_state['foreground_cwd'] = work_dir or HOME_DIR
+                            active_state['foreground_conda_env_name'] = conda_env_name or 'base'
+                            active_state['cwd'] = work_dir or HOME_DIR
+                            active_state['conda_env_name'] = conda_env_name or 'base'
+                    await websocket.send_json(_terminal_ws_response('foreground_pending', {
+                        'message': '启动命令已进入前台运行，正在等待端口监听',
+                        'cwd': work_dir or HOME_DIR,
+                        'conda_env_name': conda_env_name or 'base',
+                    }))
                     if server_row and project_id:
                         watcher_task = asyncio.create_task(_watch_foreground_port_ready(
+                            session_id=session_id,
                             websocket=websocket,
                             server_row=server_row,
                             project_id=project_id,
                             port=port,
                         ))
                         await _track_ws_watcher_task(session_id, watcher_task)
+            elif msg_type == 'complete':
+                command_text = str(data.get('command') or '')
+                cwd = _normalize_cwd(str(state.get('cwd') or state.get('foreground_cwd') or HOME_DIR))
+                if server_row:
+                    result = await _build_terminal_completion_result(server_row, cwd, session_id, command_text)
+                    await websocket.send_json(_terminal_ws_response('complete_result', result))
             elif msg_type == 'resize':
                 continue
             elif msg_type == 'close':
@@ -1113,6 +1351,169 @@ async def terminal_websocket(
             await websocket.close()
         except Exception:
             pass
+
+
+
+
+def _safe_transfer_name(name: str, fallback: str = 'pspm_upload') -> str:
+    value = posixpath.basename(str(name or '').strip().replace('\\', '/'))
+    value = re.sub(r'[^A-Za-z0-9._\-\u4e00-\u9fa5]+', '_', value).strip('._')
+    return value or fallback
+
+
+def _resolve_transfer_target(cwd: str, target_path: str | None) -> str:
+    raw = str(target_path or '').strip()
+    if not raw:
+        raw = cwd or HOME_DIR
+    return _resolve_path(_normalize_cwd(cwd), raw)
+
+
+def _safe_transfer_relative_path(relative_path: str | None) -> str:
+    value = str(relative_path or '').strip().replace('\\', '/')
+    if not value:
+        return ''
+    value = posixpath.normpath(value)
+    if value in {'.', '..'} or value.startswith('../') or value.startswith('/'):
+        return ''
+    parts = []
+    for raw_part in value.split('/'):
+        part = _safe_transfer_name(raw_part, '')
+        if not part:
+            continue
+        parts.append(part)
+    return '/'.join(parts)
+
+
+async def _cleanup_expired_download_tickets() -> None:
+    """清理过期的一次性下载票据。"""
+    now = time.time()
+    async with _terminal_download_ticket_lock:
+        expired = [
+            ticket
+            for ticket, data in _terminal_download_tickets.items()
+            if float(data.get('expires_at') or 0) <= now
+        ]
+        for ticket in expired:
+            _terminal_download_tickets.pop(ticket, None)
+
+
+async def _create_download_ticket(*, user_id: int, server_row, remote_path: str, filename: str, kind: str) -> str:
+    """生成浏览器原生下载使用的一次性 ticket。"""
+    await _cleanup_expired_download_tickets()
+    ticket = secrets.token_urlsafe(32)
+    async with _terminal_download_ticket_lock:
+        _terminal_download_tickets[ticket] = {
+            'user_id': int(user_id),
+            'server_id': int(getattr(server_row, 'id', 0) or 0),
+            'server_ip': str(getattr(server_row, 'ip', '') or ''),
+            'ssh_port': int(getattr(server_row, 'ssh_port', 22) or 22),
+            'root_password': str(getattr(server_row, 'root_password', '') or ''),
+            'remote_path': remote_path,
+            'filename': filename,
+            'kind': kind,
+            'expires_at': time.time() + DOWNLOAD_TICKET_TTL_SECONDS,
+        }
+    return ticket
+
+
+async def _consume_download_ticket(ticket: str) -> Dict[str, Any]:
+    """读取并立即删除一次性下载 ticket。"""
+    await _cleanup_expired_download_tickets()
+    safe_ticket = str(ticket or '').strip()
+    if not safe_ticket:
+        raise HTTPException(status_code=400, detail='下载凭证不能为空')
+    async with _terminal_download_ticket_lock:
+        data = _terminal_download_tickets.pop(safe_ticket, None)
+    if not data:
+        raise HTTPException(status_code=404, detail='下载凭证不存在或已过期')
+    if float(data.get('expires_at') or 0) <= time.time():
+        raise HTTPException(status_code=404, detail='下载凭证已过期')
+    return data
+
+
+async def _open_server_download_process(server_row, remote_path: str, kind: str) -> subprocess.Popen:
+    """打开一个流式下载进程，让浏览器可以直接显示下载进度。"""
+    safe_path = shlex.quote(remote_path)
+    if kind == 'dir':
+        parent = posixpath.dirname(remote_path.rstrip('/')) or '/'
+        child = posixpath.basename(remote_path.rstrip('/'))
+        remote_command = (
+            f'cd {shlex.quote(parent)} && '
+            f'if command -v zip >/dev/null 2>&1; then '
+            f'zip -r -q - {shlex.quote(child)}; '
+            f'else '
+            f'python3 -c {shlex.quote("import os,sys,zipfile\\nbase=sys.argv[1]\\nout=zipfile.ZipFile(sys.stdout.buffer, \\'w\\', zipfile.ZIP_DEFLATED)\\nfor root, dirs, files in os.walk(base):\\n    dirs[:] = [d for d in dirs if d not in {\\'.git\\', \\'__pycache__\\'}]\\n    for name in files:\\n        path=os.path.join(root,name)\\n        out.write(path, os.path.relpath(path, os.path.dirname(base)))\\nout.close()")} {shlex.quote(child)}; '
+            f'fi'
+        )
+    else:
+        remote_command = f'cat {safe_path}'
+
+    ip = str(getattr(server_row, 'ip', '') or '').strip()
+    if await _is_local_server_ip_async(ip):
+        return await asyncio.create_subprocess_exec(
+            '/bin/bash',
+            '-lc',
+            remote_command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+    if not re.match(r'^[A-Za-z0-9_.:-]+$', ip):
+        raise HTTPException(status_code=400, detail=f'服务器IP格式不合法：{ip}')
+
+    password = str(getattr(server_row, 'root_password', '') or '')
+    ssh_port = int(getattr(server_row, 'ssh_port', 22) or 22)
+    ssh_opts = f'-p {ssh_port} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 -o LogLevel=ERROR'
+    remote = f'root@{shlex.quote(ip)}'
+    quoted_command = shlex.quote(remote_command)
+    if password and (await _run_shell('command -v sshpass >/dev/null 2>&1', timeout=5))[0] == 0:
+        shell_cmd = f'sshpass -p {shlex.quote(password)} ssh {ssh_opts} {remote} {quoted_command}'
+    elif password and (await _run_shell('command -v setsid >/dev/null 2>&1', timeout=5))[0] == 0:
+        shell_cmd = _build_askpass_ssh_command(password, f'ssh {ssh_opts} {remote} {quoted_command}')
+    elif password:
+        raise HTTPException(status_code=500, detail='当前后端未安装 sshpass/setsid，无法创建远程下载通道')
+    else:
+        shell_cmd = f'ssh {ssh_opts} -o BatchMode=yes {remote} {quoted_command}'
+
+    return await asyncio.create_subprocess_exec(
+        '/bin/bash',
+        '-lc',
+        shell_cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+
+async def _stream_server_download(server_row, remote_path: str, kind: str):
+    """把远端文件或目录流式转发给浏览器。"""
+    process = await _open_server_download_process(server_row, remote_path, kind)
+    try:
+        assert process.stdout is not None
+        while True:
+            chunk = await process.stdout.read(1024 * 256)
+            if not chunk:
+                break
+            yield chunk
+        await process.wait()
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.communicate()
+
+
+async def _upload_terminal_file_to_server(server_row, local_path: str, remote_path: str) -> None:
+    parent = posixpath.dirname(remote_path) or HOME_DIR
+    with open(local_path, 'rb') as fh:
+        encoded = base64.b64encode(fh.read()).decode('ascii')
+    script = (
+        f'mkdir -p {shlex.quote(parent)} && '
+        f'base64 -d > {shlex.quote(remote_path)} <<\'PSPM_UPLOAD_EOF\'\n'
+        f'{encoded}\n'
+        'PSPM_UPLOAD_EOF\n'
+    )
+    code, out, err = await _run_server_shell(server_row, script, timeout=1800)
+    if code != 0:
+        raise HTTPException(status_code=400, detail=(err.strip() or out.strip() or '上传失败'))
 
 
 @router.get('/servers', name='会话可用服务器', response_model=schemas.pspm.TerminalServerOptionsResponse)
@@ -1201,6 +1602,222 @@ async def create_terminal_session(
             welcome_message=f'连接成功：{server.ip}',
         )
     )
+
+
+@router.post('/upload', name='终端上传', response_model=schemas.base.BaseResponse)
+async def upload_terminal_file(
+    *,
+    session: SessionDep,
+    current_user=Depends(require_permission('project_management', None)),
+    session_id: str = Form(...),
+    target_path: str = Form(''),
+    relative_path: str = Form(''),
+    file: UploadFile = File(...),
+):
+    """把文件上传到当前终端会话所在服务器。"""
+    server_row, cwd = await _get_transfer_session_context(session, current_user, session_id)
+    target = _resolve_transfer_target(cwd, target_path)
+    safe_name = _safe_transfer_name(file.filename or 'upload.bin', 'upload.bin')
+    safe_relative_path = _safe_transfer_relative_path(relative_path)
+    if safe_relative_path:
+        remote_path = posixpath.join(target, safe_relative_path)
+    else:
+        code, _out, _err = await _run_server_shell(server_row, f'test -d {shlex.quote(target)}', timeout=10)
+        remote_path = posixpath.join(target, safe_name) if code == 0 else target
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        tmp_path = tmp.name
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            tmp.write(chunk)
+        tmp.flush()
+    try:
+        await _upload_terminal_file_to_server(server_row, tmp_path, remote_path)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+    return schemas.base.BaseResponse(message=f'上传完成：{remote_path}')
+
+
+@router.post('/download-ticket', name='终端创建下载凭证', response_model=schemas.base.ItemResponse)
+async def create_terminal_download_ticket(
+    *,
+    session: SessionDep,
+    current_user=Depends(require_permission('project_management', None)),
+    session_id: str,
+    path: str,
+):
+    """创建一次性下载凭证，供浏览器原生下载使用。"""
+    server_row, _cwd = await _get_transfer_session_context(session, current_user, session_id)
+    root = _get_transfer_root(current_user)
+    remote_path = _resolve_transfer_browser_target(root, path)
+    base_name = _safe_transfer_name(posixpath.basename(remote_path.rstrip('/')) or 'download', 'download')
+    quoted_path = shlex.quote(remote_path)
+    check_script = (
+        f'if [ -d {quoted_path} ]; then echo "dir\t0"; '
+        f'elif [ -f {quoted_path} ]; then printf "file\\t%s\\n" "$(stat -c %s {quoted_path} 2>/dev/null || echo 0)"; '
+        'else echo "missing\t0"; fi'
+    )
+    code, out, _err = await _run_server_shell(server_row, check_script, timeout=10)
+    last_line = (out or '').strip().splitlines()[-1] if code == 0 and (out or '').strip() else 'missing\t0'
+    kind, _, size_text = last_line.partition('\t')
+    kind = kind.strip()
+    if kind == 'missing':
+        raise HTTPException(status_code=404, detail='文件或目录不存在')
+    filename = f'{base_name}.zip' if kind == 'dir' else base_name
+    ticket = await _create_download_ticket(
+        user_id=current_user.id,
+        server_row=server_row,
+        remote_path=remote_path,
+        filename=filename,
+        kind=kind,
+    )
+    async with _terminal_download_ticket_lock:
+        if ticket in _terminal_download_tickets:
+            _terminal_download_tickets[ticket]['size'] = int(size_text or 0) if str(size_text or '').isdigit() else 0
+    return schemas.base.ItemResponse(data={
+        'ticket': ticket,
+        'filename': filename,
+        'size': int(size_text or 0) if str(size_text or '').isdigit() else 0,
+        'expires_in': DOWNLOAD_TICKET_TTL_SECONDS,
+    })
+
+
+@router.get('/download-direct', name='终端原生下载')
+async def download_terminal_file_direct(ticket: str):
+    """使用一次性凭证流式下载文件或目录，让浏览器原生下载栏显示进度。"""
+    data = await _consume_download_ticket(ticket)
+    server_row = SimpleNamespace(
+        id=data.get('server_id'),
+        ip=data.get('server_ip'),
+        ssh_port=data.get('ssh_port') or 22,
+        root_password=data.get('root_password') or '',
+    )
+    remote_path = str(data.get('remote_path') or '')
+    kind = str(data.get('kind') or 'file')
+    filename = str(data.get('filename') or 'download')
+    media_type = 'application/zip' if kind == 'dir' else 'application/octet-stream'
+    header_name = quote(filename)
+    headers = {'Content-Disposition': f"attachment; filename*=UTF-8''{header_name}"}
+    size = int(data.get('size') or 0)
+    if kind == 'file' and size > 0:
+        headers['Content-Length'] = str(size)
+    return StreamingResponse(
+        _stream_server_download(server_row, remote_path, kind),
+        media_type=media_type,
+        headers=headers,
+    )
+
+
+@router.get('/download', name='终端下载')
+async def download_terminal_file(
+    *,
+    session: SessionDep,
+    current_user=Depends(require_permission('project_management', None)),
+    session_id: str,
+    path: str,
+):
+    """从当前终端会话所在服务器下载文件或目录。"""
+    server_row, _cwd = await _get_transfer_session_context(session, current_user, session_id)
+    root = _get_transfer_root(current_user)
+    remote_path = _resolve_transfer_browser_target(root, path)
+    base_name = _safe_transfer_name(posixpath.basename(remote_path.rstrip('/')) or 'download', 'download')
+    quoted_path = shlex.quote(remote_path)
+    check_script = f'if [ -d {quoted_path} ]; then echo dir; elif [ -f {quoted_path} ]; then echo file; else echo missing; fi'
+    code, out, _err = await _run_server_shell(server_row, check_script, timeout=10)
+    kind = (out or '').strip().splitlines()[-1] if code == 0 and (out or '').strip() else 'missing'
+    if kind == 'missing':
+        raise HTTPException(status_code=404, detail='文件或目录不存在')
+    if kind == 'dir':
+        filename = f'{base_name}.zip'
+        parent = posixpath.dirname(remote_path.rstrip('/')) or '/'
+        child = posixpath.basename(remote_path.rstrip('/'))
+        zip_script = (
+            f'cd {shlex.quote(parent)} && '
+            f'if command -v zip >/dev/null 2>&1; then '
+            f'zip -r -q - {shlex.quote(child)}; '
+            f'else '
+            f'python3 -c {shlex.quote("import os,sys,zipfile\\nbase=sys.argv[1]\\nout=zipfile.ZipFile(sys.stdout.buffer, \\'w\\', zipfile.ZIP_DEFLATED)\\nfor root, dirs, files in os.walk(base):\\n    dirs[:] = [d for d in dirs if d not in {\\'.git\\', \\'__pycache__\\'}]\\n    for name in files:\\n        path=os.path.join(root,name)\\n        out.write(path, os.path.relpath(path, os.path.dirname(base)))\\nout.close()")} {shlex.quote(child)}; '
+            f'fi'
+        )
+        cmd = f'{zip_script} | base64 -w 0'
+        media_type = 'application/zip'
+    else:
+        filename = base_name
+        cmd = f'base64 -w 0 {quoted_path}'
+        media_type = 'application/octet-stream'
+    code, out, err = await _run_server_shell(server_row, cmd, timeout=1800)
+    if code != 0:
+        raise HTTPException(status_code=400, detail=(err.strip() or out.strip() or '下载失败'))
+    try:
+        data = base64.b64decode((out or '').strip())
+    except Exception:
+        raise HTTPException(status_code=500, detail='下载内容解析失败')
+    header_name = quote(filename)
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={'Content-Disposition': f"attachment; filename*=UTF-8''{header_name}"},
+    )
+
+
+@router.get('/list-path', name='终端文件列表', response_model=schemas.base.ItemResponse)
+async def list_terminal_path(
+    *,
+    session: SessionDep,
+    current_user=Depends(require_permission('project_management', None)),
+    session_id: str,
+    path: str = '',
+):
+    """列出当前终端会话所在服务器的文件和目录，供下载弹框下拉选择。"""
+    server_row, _cwd = await _get_transfer_session_context(session, current_user, session_id)
+    root = _get_transfer_root(current_user)
+    target = _resolve_transfer_browser_target(root, path)
+    quoted_target = shlex.quote(target)
+    script = (
+        f'target={quoted_target}; '
+        'if [ -d "$target" ]; then '
+        'find "$target" -maxdepth 1 -mindepth 1 -printf "%y\\t%p\\n" 2>/dev/null | sort; '
+        'elif [ -f "$target" ]; then '
+        'printf "f\\t%s\\n" "$target"; '
+        'else exit 44; fi'
+    )
+    code, out, err = await _run_server_shell(server_row, script, timeout=20)
+    if code != 0:
+        raise HTTPException(status_code=404, detail=(err.strip() or out.strip() or '文件或目录不存在'))
+    items = []
+    for line in (out or '').splitlines():
+        if '\t' not in line:
+            continue
+        kind, item_path = line.split('\t', 1)
+        name = posixpath.basename(item_path.rstrip('/')) or item_path
+        if name.startswith('.'):
+            continue
+        items.append({
+            'name': name,
+            'path': item_path,
+            'type': 'dir' if kind == 'd' else 'file',
+        })
+    root = _normalize_cwd(root)
+    if target == root:
+        parent = root
+        can_go_parent = False
+    else:
+        parent = posixpath.dirname(target.rstrip('/')) or root
+        if parent == '.':
+            parent = root
+        parent = _ensure_under_transfer_root(parent, root)
+        can_go_parent = True
+    return schemas.base.ItemResponse(data={
+        'cwd': target,
+        'root': root,
+        'parent': parent,
+        'can_go_parent': can_go_parent,
+        'items': items,
+    })
 
 
 @router.post('/execute', name='执行命令', response_model=schemas.pspm.TerminalExecuteResponse)
@@ -1412,48 +2029,15 @@ async def complete_terminal_command(
     返回：
     - TerminalCompleteResponse：补全后的命令和候选项列表。
     """
-    session_data = await _get_session_data(payload.session_id, current_user.id)
-    server_row = await _get_session_server_row(session, current_user, session_data)
-    cwd = _normalize_cwd(session_data.get('cwd'))
-    original = str(payload.command or '')
-    prefix, token = _extract_path_token(original)
-
-    command_candidates: List[str] = []
-    if _is_command_token(prefix, token):
-        command_candidates = await _complete_command_candidates_on_server(server_row, token)
-
-    candidates = command_candidates if command_candidates else await _complete_path_candidates_on_server(server_row, cwd, token)
-    if not candidates:
-        return schemas.pspm.TerminalCompleteResponse(
-            data=schemas.pspm.TerminalCompleteResult(
-                session_id=payload.session_id,
-                original_command=original,
-                completed_command=original,
-                candidates=[],
-                cwd=cwd,
-                message='no_match',
-            )
-        )
-
-    if len(candidates) == 1:
-        completed = f'{prefix}{candidates[0]}'
-        if command_candidates:
-            completed = f'{completed} '
-        elif not candidates[0].endswith('/'):
-            completed = f'{completed} '
-    else:
-        cp = _common_prefix(candidates)
-        completed = f'{prefix}{cp}' if cp and cp != token else original
-
+    server_row, cwd, _conda_env_name = await _get_terminal_session_context(session, current_user, payload.session_id)
+    result = await _build_terminal_completion_result(
+        server_row=server_row,
+        cwd=cwd,
+        session_id=payload.session_id,
+        command=str(payload.command or ''),
+    )
     return schemas.pspm.TerminalCompleteResponse(
-        data=schemas.pspm.TerminalCompleteResult(
-            session_id=payload.session_id,
-            original_command=original,
-            completed_command=completed,
-            candidates=candidates,
-            cwd=cwd,
-            message='ok',
-        )
+        data=schemas.pspm.TerminalCompleteResult(**result)
     )
 
 
@@ -1476,7 +2060,12 @@ async def close_terminal_session(
     """
     _ = session
     removed_legacy = await _remove_session(payload.session_id, current_user.id)
-    removed_ws = await _close_ws_terminal_session(payload.session_id, current_user.id)
+    ws_session_id = payload.session_id
+    async with _ws_terminal_lock:
+        has_ws_session = ws_session_id in _ws_terminal_sessions
+    if not has_ws_session:
+        ws_session_id = await _find_ws_terminal_session_id_by_pid(current_user.id, payload.session_id)
+    removed_ws = await _close_ws_terminal_session(ws_session_id, current_user.id) if ws_session_id else False
     if not removed_legacy and not removed_ws:
         raise HTTPException(status_code=404, detail='会话不存在')
     return schemas.base.BaseResponse(message='会话已关闭')
