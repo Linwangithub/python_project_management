@@ -29,3 +29,9 @@ storage/files/*
 *.bak
 *.bak_*
 *.failed_sync*
+
+# Runtime and local backup files
+backend.log
+backups/
+src/app/api/pspm/projects.py.bak-*
+src/app_bak_*/
