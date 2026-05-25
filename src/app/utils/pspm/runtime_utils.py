@@ -480,8 +480,8 @@ async def _start_project_process(
   launch_mode_text = MSG_BACK if run_in_background else MSG_FRONT
   selected_port = configured_port or _extract_port_from_command(command)
   conda_init = await _detect_remote_conda_init(server_row)
-  visible_command = f'nohup {command} >> {log_file} 2>&1 &' if run_in_background else command
-  launch_command = f'nohup {command} >> "$log_file" 2>&1 &' if run_in_background else f'{command} >> "$log_file" 2>&1 &'
+  visible_command = f'nohup {command} &'
+  launch_command = f'nohup {command} &'
 
   script = f"""
 set -euo pipefail
