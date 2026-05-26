@@ -1,3 +1,8 @@
+"""异常处理模块，统一定义业务异常与 FastAPI 异常响应。
+
+本模块只维护本文件所属层级的职责，避免接口、服务、工具和配置逻辑互相混杂。
+"""
+
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.exception_handlers import http_exception_handler
@@ -11,6 +16,10 @@ logger = logging.getLogger(__name__)
 
 def register(app: FastAPI) -> None:
     # 注册未处理异常处理器
+    """注册模块组件或处理用户注册。
+
+    在路由模块中用于创建用户并绑定默认角色；在核心模块中用于注册应用能力。
+    """
     app.add_exception_handler(Exception, global_exception_handler)
     # 注册HTTP异常处理器
     app.add_exception_handler(StarletteHTTPException, custom_http_exception_handler)

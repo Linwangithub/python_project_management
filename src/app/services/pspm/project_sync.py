@@ -1,9 +1,30 @@
-﻿import os
+"""项目同步服务模块，负责把服务器上已存在的项目、环境、数据库和 Nginx 配置同步成系统记录。
+
+本模块只维护本文件所属层级的职责，避免接口、服务、工具和配置逻辑互相混杂。
+"""
+
+import os
 import shlex
 from fastapi import HTTPException
 
 from app import crud, schemas
 from app.services.pspm.project_detail import record_project_operation, snapshot_project_config
+from app.services.pspm.project_sync_nginx import (
+  _validate_sync_nginx_config,
+)
+from app.services.pspm.project_sync_helpers import (
+  _clean_python_version_output,
+  _project_base_path_for_user,
+  _safe_existing_database_name_from_list,
+  _safe_sync_abs_path,
+  _safe_sync_backend_path,
+  _safe_sync_entry_file_path,
+)
+from app.services.pspm.project_sync_server_helpers import (
+  _get_allowed_server_by_ip,
+  _server_directory_exists,
+  _server_file_exists,
+)
 from app.services.pspm.project_helpers import (
   frontend_root_for_project,
   list_conda_env_names_on_server,
@@ -18,154 +39,17 @@ from app.utils.pspm.db_utils import (
   _safe_db_port,
   _safe_db_user,
 )
-from app.utils.pspm.nginx_utils import (
-  _collect_nginx_conf_inventory_on_server,
-  _find_server_block_ranges,
-  _get_running_nginx_conf_path_on_server,
-  _is_nginx_running_on_server,
-  _read_text_on_server,
-  _server_block_listen_ports,
-  _server_block_proxy_pass_ports,
-  _validate_requested_nginx_conf_path,
-)
 from app.utils.pspm.path_utils import (
-  _normalize_path,
   _safe_conda_name,
-  _safe_optional_port_text,
   _safe_project_name,
   _safe_rel_path_input,
 )
 from app.utils.pspm.project_config import CONDA_INIT
 from app.utils.pspm.shell_utils import (
-  _find_server_row_by_ip,
-  _list_allowed_server_rows,
-  _ping_from_server_to_target,
   _run_server_shell,
   _split_lines,
 )
 
-
-def _project_base_path_for_user(current_user, is_root: bool) -> str:
-  """返回当前用户同步已有项目时允许浏览的项目根目录。
-
-  参数：
-  - current_user：当前登录用户。
-  - is_root：当前用户是否为 root 角色。
-
-  作用：
-  - 同步已有项目只能在配置文件定义的项目目录前缀下选择目录。
-  - root 使用 `/root`，普通用户使用 `/home/{username}`。
-
-  返回：
-  - 绝对路径字符串。
-  """
-  username = str(getattr(current_user, 'username', '') or 'user').strip() or 'user'
-  if is_root:
-    return '/root'
-  return _normalize_path(f'/home/{username}')
-
-
-def _clean_python_version_output(text: str) -> str:
-  """清洗 Conda Python 版本输出。
-
-  参数：
-  - text：`conda run -n xxx python --version` 的 stdout/stderr 合并文本。
-
-  作用：
-  - SSH 首次连接远程服务器时，stderr 里可能包含 `Warning: Permanently added ...`。
-  - 前端只需要展示实际 Python 版本，不应该把 SSH warning 混进去。
-
-  返回：
-  - 形如 `Python 3.8.13` 的版本文本；未匹配到时返回原始非 warning 文本。
-  """
-  lines = [x.strip() for x in _split_lines(text) if x.strip()]
-  for line in lines:
-    if line.lower().startswith('python '):
-      return line
-  filtered = [line for line in lines if not line.lower().startswith('warning: permanently added')]
-  return ' '.join(filtered).strip()
-
-
-def _safe_sync_abs_path(base_path: str, rel_path: str) -> str:
-  """把同步弹框传入的相对目录解析为安全绝对路径。
-
-  参数：
-  - base_path：允许的项目根目录。
-  - rel_path：前端级联目录相对路径。
-
-  作用：
-  - 防止通过 `..` 或绝对路径越过项目根目录。
-
-  返回：
-  - 解析后的绝对路径。
-  """
-  base = _normalize_path(base_path)
-  rel = _safe_rel_path_input(rel_path)
-  if not rel:
-    return base
-  target = os.path.normpath(os.path.join(base, rel))
-  if target != base and not target.startswith(f'{base}/'):
-    raise HTTPException(status_code=400, detail='项目目录越界')
-  return target
-
-
-def _safe_sync_backend_path(base_path: str, backend_path: str) -> str:
-  """校验同步项目目录必须存在于允许前缀下。"""
-  base = _normalize_path(base_path)
-  target = _normalize_path(backend_path)
-  if target == base:
-    raise HTTPException(status_code=400, detail='请选择具体项目目录，不能选择项目根目录')
-  if not target.startswith(f'{base}/'):
-    raise HTTPException(status_code=400, detail=f'项目目录必须位于 {base} 下')
-  return target
-
-
-def _safe_sync_entry_file_path(backend_path: str, entry_file_path: str) -> str:
-  """校验同步已有项目时选择的入口文件必须位于项目目录内。
-
-  参数：
-  - backend_path：已经选择的项目目录绝对路径。
-  - entry_file_path：前端提交的入口文件绝对路径，可以为空。
-
-  作用：
-  - 同步已有项目时允许一起登记入口文件。
-  - 如果用户选择了入口文件，则必须保证它没有越过项目目录。
-
-  返回：
-  - 空字符串，或标准化后的入口文件绝对路径。
-  """
-  value = str(entry_file_path or '').strip()
-  if not value:
-    return ''
-  base = _normalize_path(backend_path)
-  target = _normalize_path(value)
-  if target == base or not target.startswith(f'{base}/'):
-    raise HTTPException(status_code=400, detail=f'入口文件必须位于项目目录 {base} 下')
-  return target
-
-
-async def _get_allowed_server_by_ip(session, current_user, server_ip: str):
-  """按 IP 查询当前用户可使用的服务器记录。"""
-  ip = str(server_ip or '').strip()
-  if not ip:
-    raise HTTPException(status_code=400, detail='服务器IP不能为空')
-  servers = await _list_allowed_server_rows(session, current_user)
-  server_row = _find_server_row_by_ip(servers, ip)
-  if not server_row:
-    raise HTTPException(status_code=403, detail='当前用户无该服务器使用权限')
-  return servers, server_row
-
-
-async def _server_directory_exists(server_row, path: str) -> bool:
-  """检查指定服务器目录是否存在。"""
-  code, _out, _err = await _run_server_shell(server_row, f'test -d {shlex.quote(path)}', timeout=15)
-  return code == 0
-
-
-async def _server_file_exists(server_row, path: str) -> bool:
-  """检查指定服务器文件是否存在。"""
-  code, _out, _err = await _run_server_shell(server_row, f'test -f {shlex.quote(path)}', timeout=15)
-  return code == 0
 
 
 async def _list_directory_children(server_row, path: str) -> list[str]:
@@ -173,7 +57,7 @@ async def _list_directory_children(server_row, path: str) -> list[str]:
   command = f'if [ -d {shlex.quote(path)} ]; then find {shlex.quote(path)} -mindepth 1 -maxdepth 1 -type d ! -name ".*" -printf "%f\\n" | sort; fi'
   code, out, err = await _run_server_shell(server_row, command, timeout=60)
   if code != 0:
-    raise HTTPException(status_code=500, detail=f'读取项目目录失败：{err.strip() or out.strip() or "unknown error"}')
+    raise HTTPException(status_code=500, detail=f'读取项目目录失败：{err.strip() or out.strip() or '未知错误'}')
   return [x.strip() for x in _split_lines(out) if x.strip()]
 
 
@@ -198,7 +82,7 @@ async def _list_entry_children(server_row, path: str, rel_dir: str) -> list[sche
   if code == 2:
     raise HTTPException(status_code=400, detail='入口文件目录不存在')
   if code != 0:
-    raise HTTPException(status_code=500, detail=f'读取入口文件目录失败：{err.strip() or out.strip() or "unknown error"}')
+    raise HTTPException(status_code=500, detail=f'读取入口文件目录失败：{err.strip() or out.strip() or '未知错误'}')
 
   rel_base = _safe_rel_path_input(rel_dir)
   nodes: list[schemas.pspm.ProjectEntryPathNode] = []
@@ -223,7 +107,7 @@ async def _query_conda_env_detail(server_row, env_name: str) -> tuple[str, str]:
   name = _safe_conda_name(env_name)
   code, out, err = await _run_server_shell(server_row, f'{CONDA_INIT}; conda info', timeout=120)
   if code != 0:
-    raise HTTPException(status_code=500, detail=f'查询Conda信息失败：{err.strip() or out.strip() or "unknown error"}')
+    raise HTTPException(status_code=500, detail=f'查询Conda信息失败：{err.strip() or out.strip() or '未知错误'}')
 
   envs_dir = parse_conda_envs_dir(out)
   if not envs_dir:
@@ -296,7 +180,7 @@ async def list_sync_conda_envs_service(session, current_user, payload: schemas.p
   _servers, server_row = await _get_allowed_server_by_ip(session, current_user, payload.server_ip)
   code, out, err = await _run_server_shell(server_row, f'{CONDA_INIT}; conda info', timeout=120)
   if code != 0:
-    raise HTTPException(status_code=500, detail=f'查询Conda信息失败：{err.strip() or out.strip() or "unknown error"}')
+    raise HTTPException(status_code=500, detail=f'查询Conda信息失败：{err.strip() or out.strip() or '未知错误'}')
   envs_dir = parse_conda_envs_dir(out)
   if not envs_dir:
     raise HTTPException(status_code=500, detail='未解析到Conda环境目录')
@@ -343,254 +227,6 @@ async def check_sync_database_service(payload: schemas.pspm.ProjectSyncDatabaseC
     database_exists=database_exists,
     can_create=False,
     databases=databases,
-  )
-
-
-def _safe_existing_database_name_from_list(database_name: str, visible_databases: list[str]) -> str:
-  """校验同步已有项目选择的数据库名必须来自服务器实际数据库列表。
-
-  参数：
-  - database_name：前端下拉框选中的数据库名。
-  - visible_databases：当前账号通过 `SHOW DATABASES` 查询到的业务数据库列表。
-
-  作用：
-  - 同步已有项目不是创建新数据库，不能复用只允许字母数字下划线的创建数据库校验。
-  - 只允许选择真实存在且当前账号可见的数据库名，避免前端手工篡改提交值。
-
-  返回：
-  - 原始数据库名，保留短横线、点号、中文等 MySQL 已存在库名字符。
-  """
-  value = str(database_name or '').strip()
-  if not value:
-    raise HTTPException(status_code=400, detail='数据库名不能为空')
-  for item in visible_databases or []:
-    candidate = str(item or '').strip()
-    if candidate == value:
-      return candidate
-  raise HTTPException(status_code=400, detail=f'数据库不存在或当前账号不可见：{value}')
-
-
-def _find_matching_nginx_server_block(conf_text: str, frontend_port: int, backend_port: int) -> str:
-  """从 Nginx 配置文本中提取匹配指定前后端端口的 server 块。
-
-  参数：
-  - conf_text：Nginx 配置文件完整文本。
-  - frontend_port：页面填写的 Nginx 前端 listen 端口。
-  - backend_port：页面填写的后端部署端口，也就是 proxy_pass 指向端口。
-
-  作用：
-  - 同步已有项目时，用户只选择已有 Nginx 配置文件和端口。
-  - 后端自动找到对应 server 块并保存为项目配置快照。
-
-  返回：
-  - 匹配到的 server 块文本；找不到返回空字符串。
-  """
-  text = str(conf_text or '')
-  for start, end in _find_server_block_ranges(text):
-    block = text[start:end].strip()
-    if frontend_port in _server_block_listen_ports(block) and backend_port in _server_block_proxy_pass_ports(block):
-      return block if block.endswith('\n') else f'{block}\n'
-  return ''
-
-
-async def _validate_sync_nginx_config(
-  *,
-  servers,
-  project_server_row,
-  project_name: str,
-  server_ip: str,
-  nginx_server_ip: str,
-  requested_conf_path: str,
-  frontend_port: str,
-  backend_deploy_port: str,
-  nginx_config_text: str,
-) -> dict[str, str]:
-  """校验同步已有项目绑定的 Nginx 配置。"""
-  nginx_ip = str(nginx_server_ip or server_ip).strip()
-  nginx_server_row = _find_server_row_by_ip(servers, nginx_ip)
-  if not nginx_server_row:
-    raise HTTPException(status_code=403, detail='当前用户无该Nginx服务器使用权限')
-
-  ping_ok, ping_msg = await _ping_from_server_to_target(project_server_row, nginx_ip)
-  if not ping_ok:
-    raise HTTPException(status_code=400, detail=f'Nginx服务器不可达：{ping_msg}')
-
-  running = await _is_nginx_running_on_server(nginx_server_row)
-  if not running:
-    raise HTTPException(status_code=400, detail='nginx服务未开启')
-
-  running_conf_path = await _get_running_nginx_conf_path_on_server(nginx_server_row)
-  inventory = await _collect_nginx_conf_inventory_on_server(nginx_server_row, running_conf_path)
-  nginx_conf_path = _validate_requested_nginx_conf_path(requested_conf_path, inventory)
-  if not await _server_file_exists(nginx_server_row, nginx_conf_path):
-    raise HTTPException(status_code=400, detail=f'Nginx配置文件不存在：{nginx_conf_path}')
-
-  nginx_frontend_port = _safe_optional_port_text(frontend_port)
-  nginx_backend_port = _safe_optional_port_text(backend_deploy_port)
-  if not nginx_frontend_port or not nginx_backend_port:
-    raise HTTPException(status_code=400, detail='启用Nginx时必须填写前端端口和后端部署端口')
-  if server_ip == nginx_ip and nginx_frontend_port == nginx_backend_port:
-    raise HTTPException(status_code=400, detail='服务器IP和Nginx服务器IP相同时，Nginx前端端口和后端部署端口不能相同')
-
-  frontend_port_int = int(nginx_frontend_port)
-  backend_port_int = int(nginx_backend_port)
-
-  # 同步已有项目绑定的是已经存在的 server 块，listen 端口本来就应该已被 Nginx 使用，
-  # 因此这里不能沿用创建项目的“端口未占用”校验，只校验配置文件里是否存在匹配 server 块。
-  # 同步已有项目只绑定已存在 Nginx 配置，不要求前端提交详细配置文本。
-  # 后端读取用户选择的配置文件，自动提取同时包含 listen 前端端口和 proxy_pass 后端端口的 server 块。
-  ok, file_text = await _read_text_on_server(nginx_server_row, nginx_conf_path)
-  if not ok:
-    raise HTTPException(status_code=400, detail=f'读取Nginx配置失败：{file_text}')
-  config_text = _find_matching_nginx_server_block(file_text, frontend_port_int, backend_port_int)
-  if not config_text:
-    raise HTTPException(
-      status_code=400,
-      detail=f'所选Nginx配置文件中未找到 listen {frontend_port_int} 且 proxy_pass 指向端口 {backend_port_int} 的 server 块',
-    )
-
-  return {
-    'nginx_server_ip': nginx_ip,
-    'nginx_conf_path': nginx_conf_path,
-    'frontend_port': nginx_frontend_port,
-    'backend_deploy_port': nginx_backend_port,
-    'nginx_config_text': config_text,
-  }
-
-
-def _extract_nginx_server_name(block_text: str) -> str:
-  """从单个 Nginx server 块中提取 server_name。
-
-  参数：
-  - block_text：一个完整的 server 块文本。
-
-  返回：
-  - 第一个 server_name 值；没有配置时返回空字符串。
-  """
-  import re
-
-  match = re.search(r'(?m)^\s*server_name\s+([^;]+);', str(block_text or ''))
-  if not match:
-    return ''
-  return ' '.join(match.group(1).strip().split())
-
-
-def _list_nginx_server_port_options(conf_text: str) -> list[schemas.pspm.ProjectSyncNginxServerPortOption]:
-  """从 Nginx 配置文件文本中列出可同步的 server 端口组合。
-
-  参数：
-  - conf_text：用户选择的 Nginx 配置文件完整文本。
-
-  作用：
-  - 同步已有项目时，前端端口必须从已有 listen 端口里选择。
-  - 后端部署端口由同一个 server 块中的 proxy_pass 端口自动回显。
-
-  返回：
-  - 每个包含 listen 和 proxy_pass 的 server 块组合。
-  """
-  result: list[schemas.pspm.ProjectSyncNginxServerPortOption] = []
-  seen: set[tuple[int, int, str]] = set()
-  text = str(conf_text or '')
-  for start, end in _find_server_block_ranges(text):
-    block = text[start:end].strip()
-    listen_ports = sorted(_server_block_listen_ports(block))
-    proxy_ports = sorted(_server_block_proxy_pass_ports(block))
-    if not listen_ports or not proxy_ports:
-      continue
-    server_name = _extract_nginx_server_name(block)
-    block_text = block if block.endswith('\n') else f'{block}\n'
-    for listen_port in listen_ports:
-      for proxy_port in proxy_ports:
-        key = (listen_port, proxy_port, block_text)
-        if key in seen:
-          continue
-        seen.add(key)
-        label_extra = f' · {server_name}' if server_name else ''
-        result.append(schemas.pspm.ProjectSyncNginxServerPortOption(
-          label=f'{listen_port} → {proxy_port}{label_extra}',
-          frontend_port=str(listen_port),
-          backend_deploy_port=str(proxy_port),
-          server_name=server_name,
-          nginx_config_text=block_text,
-        ))
-  return result
-
-
-async def list_sync_nginx_server_port_options_service(session, current_user, payload: schemas.pspm.ProjectSyncNginxServerPortOptionsRequest):
-  """查询同步已有项目可选择的 Nginx 前端端口和后端代理端口。
-
-  参数：
-  - session：数据库会话。
-  - current_user：当前登录用户。
-  - payload：项目服务器 IP、Nginx 服务器 IP、已选择的 Nginx 配置文件路径。
-
-  作用：
-  - 读取用户选择的真实 Nginx 配置文件。
-  - 提取所有包含 listen 和 proxy_pass 的 server 块。
-  - 前端据此把 Nginx 前端端口渲染为下拉框，后端部署端口自动回显。
-
-  返回：
-  - `ProjectSyncNginxServerPortOptionsData`，其中 options 是可同步的端口组合列表。
-  """
-  servers, project_server_row = await _get_allowed_server_by_ip(session, current_user, payload.server_ip)
-  server_ip = str(payload.server_ip or '').strip()
-  nginx_ip = str(payload.nginx_server_ip or server_ip).strip()
-  nginx_server_row = _find_server_row_by_ip(servers, nginx_ip)
-  if not nginx_server_row:
-    raise HTTPException(status_code=403, detail='当前用户无该Nginx服务器使用权限')
-
-  ping_ok, ping_msg = await _ping_from_server_to_target(project_server_row, nginx_ip)
-  if not ping_ok:
-    raise HTTPException(status_code=400, detail=f'Nginx服务器不可达：{ping_msg}')
-
-  running = await _is_nginx_running_on_server(nginx_server_row)
-  if not running:
-    raise HTTPException(status_code=400, detail='nginx服务未开启')
-
-  running_conf_path = await _get_running_nginx_conf_path_on_server(nginx_server_row)
-  inventory = await _collect_nginx_conf_inventory_on_server(nginx_server_row, running_conf_path)
-  nginx_conf_path = _validate_requested_nginx_conf_path(payload.nginx_conf_path, inventory)
-  if not await _server_file_exists(nginx_server_row, nginx_conf_path):
-    raise HTTPException(status_code=400, detail=f'Nginx配置文件不存在：{nginx_conf_path}')
-
-  ok, conf_text = await _read_text_on_server(nginx_server_row, nginx_conf_path)
-  if not ok:
-    raise HTTPException(status_code=400, detail=f'读取Nginx配置失败：{conf_text}')
-
-  options = _list_nginx_server_port_options(conf_text)
-  if not options:
-    raise HTTPException(status_code=400, detail='所选Nginx配置文件中没有可同步的 listen + proxy_pass server 块')
-  return schemas.pspm.ProjectSyncNginxServerPortOptionsData(options=options)
-
-
-async def check_sync_nginx_server_block_service(session, current_user, payload: schemas.pspm.ProjectSyncNginxServerBlockCheckRequest):
-  """检查同步已有项目填写的 Nginx 前后端端口是否能匹配已有 server 块。
-
-  参数：
-  - session：数据库会话。
-  - current_user：当前登录用户。
-  - payload：项目服务器 IP、Nginx 服务器 IP、配置文件路径、前端端口、后端部署端口。
-
-  作用：
-  - 前端在 Nginx 前端端口和后端部署端口失焦时调用。
-  - 提前告诉用户所选配置文件里是否存在对应 server 块，不等到最终同步才报错。
-  """
-  servers, project_server_row = await _get_allowed_server_by_ip(session, current_user, payload.server_ip)
-  data = await _validate_sync_nginx_config(
-    servers=servers,
-    project_server_row=project_server_row,
-    project_name='sync_preview',
-    server_ip=str(payload.server_ip or '').strip(),
-    nginx_server_ip=payload.nginx_server_ip,
-    requested_conf_path=payload.nginx_conf_path,
-    frontend_port=payload.frontend_port,
-    backend_deploy_port=payload.backend_deploy_port,
-    nginx_config_text='',
-  )
-  return schemas.pspm.ProjectSyncNginxServerBlockCheckData(
-    ok=True,
-    nginx_config_text=data.get('nginx_config_text') or '',
-    message='已找到匹配的Nginx server块',
   )
 
 

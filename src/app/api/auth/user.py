@@ -1,3 +1,8 @@
+"""当前用户接口模块，提供登录用户信息和权限快照查询。
+
+本模块只维护本文件所属层级的职责，避免接口、服务、工具和配置逻辑互相混杂。
+"""
+
 import logging
 
 from fastapi import APIRouter, Body, HTTPException
@@ -5,6 +10,7 @@ from fastapi import APIRouter, Body, HTTPException
 from app import crud, schemas
 from app.api.deps import CurrentUser
 from app.core.deps import RedisDep, SessionDep, get_settings
+from app.utils.pspm.project_config import ROOT_PROJECT_BASE_DIR, USER_PROJECT_BASE_PATH_TEMPLATE
 
 logger = logging.getLogger(__name__)
 
@@ -18,9 +24,13 @@ async def read_user_me(
     redis: RedisDep,
     current_user: CurrentUser,
 ) -> schemas.users.ItemResponse:
+    """查询当前登录用户信息。
+
+    返回用户基础信息以及当前角色可用的项目目录前缀配置。
+    """
     settings = get_settings()
-    project_root_base_path = str(settings.project_paths.root_base_path or '/root/project').strip()
-    project_user_template = str(settings.project_paths.user_base_path_template or '/home/{username}/project').strip()
+    project_root_base_path = str(settings.project_paths.root_base_path or ROOT_PROJECT_BASE_DIR).strip()
+    project_user_template = str(settings.project_paths.user_base_path_template or USER_PROJECT_BASE_PATH_TEMPLATE).strip()
 
     username = str(current_user.username or '').strip() or 'user'
     is_root = await crud.rbac.is_root_user(session, user_id=current_user.id)
@@ -48,6 +58,10 @@ async def update_user_password(
     password: str = Body(..., description="新密码"),
     password_confirmation: str = Body(..., description="确认密码"),
 ) -> schemas.base.BaseResponse:
+    """修改当前登录用户密码。
+
+    校验旧密码和确认密码后更新密码哈希。
+    """
     if password != password_confirmation:
         raise HTTPException(status_code=400, detail="密码与确认密码不一致")
     if not await crud.users.authenticate(session, username=current_user.username, password=old_password):

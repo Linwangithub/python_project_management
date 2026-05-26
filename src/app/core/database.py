@@ -1,4 +1,4 @@
-"""Database connection and session management."""
+"""数据库连接和会话管理模块。"""
 import logging
 from typing import Optional, AsyncGenerator
 from pydantic_core import MultiHostUrl

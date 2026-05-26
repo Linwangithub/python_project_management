@@ -1,3 +1,8 @@
+"""应用包入口模块，提供 FastAPI 后端应用的顶层包标识。
+
+本模块只维护本文件所属层级的职责，避免接口、服务、工具和配置逻辑互相混杂。
+"""
+
 import logging
 from contextlib import asynccontextmanager
 
@@ -17,6 +22,10 @@ logger = logging.getLogger("app.create_app")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # type: ignore
+    """管理 FastAPI 应用生命周期。
+
+    启动时初始化日志、数据库、Redis 和定时任务；关闭时释放连接资源。
+    """
     settings = get_settings()
 
     configure_logging(project_log_level=settings.dev.log_level)
@@ -36,6 +45,10 @@ async def lifespan(app: FastAPI):  # type: ignore
 
 
 def create_app() -> FastAPI:
+    """创建并配置 FastAPI 应用实例。
+
+    注册中间件、异常处理器和 API 路由后返回应用对象。
+    """
     app = FastAPI(
         title=get_settings().dev.project_name,
         version="0.0.1",

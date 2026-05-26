@@ -1,3 +1,8 @@
+"""项目检测服务模块，负责服务器、端口、Conda、数据库和 Nginx 的校验流程。
+
+本模块只维护本文件所属层级的职责，避免接口、服务、工具和配置逻辑互相混杂。
+"""
+
 import os
 import shlex
 
@@ -37,14 +42,13 @@ from app.utils.pspm.path_utils import (
   _safe_rel_path_input,
 )
 from app.utils.pspm.project_config import CONDA_INIT
-from app.utils.pspm.runtime_utils import _inspect_project_runtime
 from app.utils.pspm.shell_utils import (
-  _assert_server_ip_allowed,
   _find_server_row_by_id,
   _find_server_row_by_ip,
   _list_allowed_server_rows,
   _ping_from_server_to_target,
   _run_server_shell,
+  _same_ip,
 )
 
 
@@ -117,7 +121,7 @@ async def list_project_conda_envs_service(session, current_user, project_id: int
 
   code, out, err = await _run_server_shell(server_row, f'{CONDA_INIT}; conda info', timeout=120)
   if code != 0:
-    raise HTTPException(status_code=500, detail=f'查询Conda信息失败：{err.strip() or out.strip() or "unknown error"}')
+    raise HTTPException(status_code=500, detail=f'查询Conda信息失败：{err.strip() or out.strip() or '未知错误'}')
 
   envs_dir = parse_conda_envs_dir(out)
   if not envs_dir:
@@ -134,34 +138,39 @@ async def check_project_name_service(session, current_user, name: str, base_path
   - session：数据库会话。
   - current_user：当前登录用户。
   - name：项目名称，来自前端新建项目弹框。
-  - base_path：项目基础路径，例如 `/root/project`。
+  - base_path：项目基础路径，例如“项目基础路径配置值”。
   - server_ip：业务目标服务器 IP。
 
   作用：
   - 前端项目名称输入框失去焦点时调用。
-  - 后端校验当前用户是否有该服务器权限，并拼出最终项目目录。
+  - 后端校验当前用户是否有该服务器权限，并在目标服务器上真实检测目录是否存在。
+  - 分布式场景下不能使用后端本机的 `os.path.exists`，否则会把远程路径误判成本机路径。
 
   返回：
   - `ProjectNameCheckResponseData`：
-    - exists：目录是否存在。
+    - exists：目标服务器上目录是否存在。
     - target_dir：最终项目目录。
   """
   project_name = _safe_project_name(name)
   normalized_base = _normalize_path(base_path)
-  _assert_server_ip_allowed(server_ip)
+  target_ip = str(server_ip or '').strip()
+  if not target_ip:
+    raise HTTPException(status_code=400, detail='服务器IP不能为空')
 
-  servers = await crud.servers.get_items(
-    session,
-    user_id=current_user.id,
-    is_root=await crud.rbac.is_root_user(session, user_id=current_user.id),
-    page=1,
-    page_size=500,
-  )
-  if not any(x.ip == server_ip for x in servers.data):
+  # 先按当前用户权限读取可操作服务器，再从授权列表中匹配页面选择的 IP。
+  servers = await _list_allowed_server_rows(session, current_user)
+  server_row = _find_server_row_by_ip(servers, target_ip)
+  if not server_row:
     raise HTTPException(status_code=403, detail='当前用户无该服务器使用权限')
 
   target_dir = _build_target_dir(normalized_base, project_name)
-  return schemas.pspm.ProjectNameCheckResponseData(exists=os.path.exists(target_dir), target_dir=target_dir)
+  # 使用远程 shell 检测目录/文件是否存在；目标是远端时走 SSH，目标是本机时自动走本地 shell。
+  code, out, err = await _run_server_shell(server_row, f'test -e {shlex.quote(target_dir)}', timeout=15)
+  if code in (0, 1):
+    return schemas.pspm.ProjectNameCheckResponseData(exists=(code == 0), target_dir=target_dir)
+
+  message = err.strip() or out.strip() or '未知错误'
+  raise HTTPException(status_code=500, detail=f'检测项目目录失败：{message}')
 
 
 async def check_project_database_service(payload: schemas.pspm.ProjectDatabaseCheckRequest):
@@ -291,18 +300,38 @@ async def check_project_port_service(session, current_user, payload: schemas.psp
 
   port = _safe_port_number(int(payload.port))
   server_row = None
-  if payload.check_nginx_conf and str(getattr(payload, 'nginx_server_ip', '') or '').strip():
+  requested_nginx_ip = str(getattr(payload, 'nginx_server_ip', '') or '').strip()
+  if payload.check_nginx_conf and requested_nginx_ip:
     servers = await _list_allowed_server_rows(session, current_user)
-    server_row = _find_server_row_by_ip(servers, str(payload.nginx_server_ip or '').strip())
+    server_row = _find_server_row_by_ip(servers, requested_nginx_ip)
     if not server_row:
       raise HTTPException(status_code=403, detail='当前用户无该Nginx服务器使用权限')
 
+  project_name_for_conflict = str(getattr(project, 'name', '') or '').strip() if project is not None else ''
+  original_nginx_ip = str(getattr(project, 'nginx_server_ip', '') or '').strip() if project is not None else ''
+  original_ports = {
+    str(getattr(project, 'frontend_port', '') or '').strip(),
+    str(getattr(project, 'backend_deploy_port', '') or '').strip(),
+  }
+  is_current_project_port = bool(
+    project is not None
+    and requested_nginx_ip
+    and original_nginx_ip
+    and _same_ip(requested_nginx_ip, original_nginx_ip)
+    and str(port) in original_ports
+  )
+  ignore_block_text = str(getattr(project, 'nginx_config_text', '') or '') if is_current_project_port else ''
+
   in_use = await _is_port_in_use_on_server(server_row, port) if server_row else await _is_port_in_use(port)
+  # 当前项目已绑定的端口可能正被当前项目自己的 Nginx 或后端进程监听。
+  # 设置弹框回显原配置或修改其他字段时，这种“自己占用自己”的情况不应阻塞下一步。
+  if is_current_project_port:
+    in_use = False
+
   nginx_conflict = False
   nginx_listen_conflict = False
   nginx_proxy_conflict = False
   conf_path = ''
-  project_name_for_conflict = str(getattr(project, 'name', '') or '').strip() if project is not None else ''
 
   if payload.check_nginx_conf:
     if server_row:
@@ -310,13 +339,24 @@ async def check_project_port_service(session, current_user, payload: schemas.psp
       if not running:
         raise HTTPException(status_code=400, detail='nginx服务未开启')
       conf_path = await _get_running_nginx_conf_path_on_server(server_row)
-      conflict = await _check_nginx_port_conflict_on_server(server_row, port, conf_path, project_name=project_name_for_conflict)
+      conflict = await _check_nginx_port_conflict_on_server(
+        server_row,
+        port,
+        conf_path,
+        project_name=project_name_for_conflict,
+        ignore_block_text=ignore_block_text,
+      )
     else:
       running = await _is_nginx_running()
       if not running:
         raise HTTPException(status_code=400, detail='nginx服务未开启')
       conf_path = await _get_running_nginx_conf_path()
-      conflict = await _check_nginx_port_conflict(port, conf_path, project_name=project_name_for_conflict)
+      conflict = await _check_nginx_port_conflict(
+        port,
+        conf_path,
+        project_name=project_name_for_conflict,
+        ignore_block_text=ignore_block_text,
+      )
     nginx_listen_conflict = bool(conflict.get('listen'))
     nginx_proxy_conflict = bool(conflict.get('proxy_pass'))
     nginx_conflict = nginx_listen_conflict or nginx_proxy_conflict
@@ -340,287 +380,4 @@ async def check_project_port_service(session, current_user, payload: schemas.psp
     nginx_conf_path=conf_path,
     message='端口可用',
   )
-
-
-
-def _join_summary_parts(parts: list[str], empty_text: str = '未配置') -> str:
-  """拼接项目列表复合字段的已配置部分。"""
-  values = [str(item or '').strip() for item in parts if str(item or '').strip()]
-  return ' / '.join(values) if values else empty_text
-
-
-async def _server_path_exists(server_row, path: str) -> bool:
-  """检查指定业务服务器上的路径是否存在。"""
-  value = str(path or '').strip()
-  if not value:
-    return False
-  code, _out, _err = await _run_server_shell(server_row, f'test -e {shlex.quote(value)}', timeout=10)
-  return code == 0
-
-
-async def _server_conda_env_exists(server_row, env_name: str) -> bool:
-  """检查指定业务服务器上的 Conda 环境是否存在。"""
-  value = str(env_name or '').strip()
-  if not value:
-    return False
-  try:
-    envs = await list_conda_env_names_on_server(server_row)
-  except Exception:
-    return False
-  return value in envs
-
-
-async def _nginx_conf_contains_project_config(server_row, conf_path: str, frontend_port: str, backend_port: str) -> bool:
-  """检查 Nginx 配置文件是否包含项目配置的 listen 和 proxy_pass 端口。"""
-  path = str(conf_path or '').strip()
-  if not path:
-    return False
-  quoted_path = shlex.quote(path)
-  checks: list[str] = [f'test -f {quoted_path}']
-  if str(frontend_port or '').strip():
-    port = shlex.quote(str(frontend_port).strip())
-    checks.append(f'grep -E "listen[[:space:]]+{port}([^0-9]|;)" {quoted_path} >/dev/null')
-  if str(backend_port or '').strip():
-    port = shlex.quote(str(backend_port).strip())
-    checks.append(f'grep -E "proxy_pass[[:space:]]+http://[^;:]+:{port}(/|;|[^0-9])" {quoted_path} >/dev/null')
-  code, _out, _err = await _run_server_shell(server_row, ' && '.join(checks), timeout=15)
-  return code == 0
-
-
-async def inspect_projects_runtime_service(session, current_user, result: schemas.pspm.ProjectItems) -> schemas.pspm.ProjectItems:
-  """Lightweight list runtime inspector.
-
-  The project list must not run the full health check for every row. It only needs
-  service_status and running_port. Full health checks remain button-triggered.
-  """
-  if not result.data:
-    return result
-
-  servers = await _list_allowed_server_rows(session, current_user)
-  server_by_id = {int(getattr(item, 'id', 0) or 0): item for item in servers.data}
-  server_by_ip = {str(getattr(item, 'ip', '') or '').strip(): item for item in servers.data}
-
-  for item in result.data:
-    db_status = str(item.status or '').strip() or '已停止'
-    item.service_status = db_status
-    item.running_port = ''
-    if db_status != '运行中':
-      continue
-
-    server_row = server_by_id.get(int(item.server_id or 0)) or server_by_ip.get(str(item.server_ip or '').strip())
-    if not server_row:
-      continue
-
-    runtime_data = await _inspect_project_runtime(server_row, item)
-    if runtime_data.get('service_status') == '运行中':
-      item.running_port = runtime_data.get('running_port') or ''
-
-  return result
-
-
-async def inspect_projects_health_service(session, current_user, result: schemas.pspm.ProjectItems) -> schemas.pspm.ProjectItems:
-  """为项目列表补充服务状态、运行端口和项目健康状态。"""
-  if not result.data:
-    return result
-
-  servers = await _list_allowed_server_rows(session, current_user)
-  server_by_id = {int(getattr(item, 'id', 0) or 0): item for item in servers.data}
-  server_by_ip = {str(getattr(item, 'ip', '') or '').strip(): item for item in servers.data}
-
-  for item in result.data:
-    problems: list[str] = []
-    server_row = server_by_id.get(int(item.server_id or 0)) or server_by_ip.get(str(item.server_ip or '').strip())
-
-    if not server_row:
-      problems.append('项目服务器不可用或无权限')
-      item.service_status = '已停止'
-      item.running_port = ''
-    else:
-      runtime_data = await _inspect_project_runtime(server_row, item)
-      item.service_status = runtime_data.get('service_status') or '已停止'
-      item.running_port = runtime_data.get('running_port') or ''
-
-      if item.backend_path and not await _server_path_exists(server_row, item.backend_path):
-        problems.append('项目目录不存在')
-      if item.conda_env_name and not await _server_conda_env_exists(server_row, item.conda_env_name):
-        problems.append('Conda环境不存在')
-
-    if item.database_name:
-      try:
-        host = _safe_db_host(item.database_host or '')
-        port = _safe_db_port(int(item.database_port or 3306))
-        user = _safe_db_user(item.database_user or '')
-        password = str(item.database_password or '')
-        ok, _message = await _check_server_mysql_connectable(host, port, user, password)
-        if not ok:
-          problems.append('数据库连接失败')
-        elif not await _check_database_exists(host, port, user, password, item.database_name):
-          problems.append('数据库不存在')
-      except Exception:
-        problems.append('数据库检测失败')
-
-    if item.nginx_conf_path or item.nginx_server_ip or item.frontend_port or item.backend_deploy_port:
-      nginx_row = server_by_ip.get(str(item.nginx_server_ip or '').strip()) or server_row
-      if not nginx_row:
-        problems.append('Nginx服务器不可用或无权限')
-      elif not await _is_nginx_running_on_server(nginx_row):
-        problems.append('Nginx服务未运行')
-      elif item.nginx_conf_path:
-        ok_conf = await _nginx_conf_contains_project_config(
-          nginx_row,
-          item.nginx_conf_path,
-          item.frontend_port or '',
-          item.backend_deploy_port or '',
-        )
-        if not ok_conf:
-          problems.append('Nginx配置不匹配或文件不存在')
-
-    item.nginx_info = _join_summary_parts([
-      item.nginx_server_ip or '',
-      f'前端:{item.frontend_port}' if item.frontend_port else '',
-      f'后端:{item.backend_deploy_port}' if item.backend_deploy_port else '',
-    ])
-    item.database_info = _join_summary_parts([
-      item.database_host or '',
-      f'库:{item.database_name}' if item.database_name else '',
-    ])
-    item.project_status = '异常' if problems else '正常'
-    item.project_status_detail = '；'.join(problems)
-    item.status = item.service_status
-
-  return result
-
-
-def _project_schema_from_orm(project, owner_name: str = '', server_ip: str | None = None) -> schemas.pspm.ProjectItem:
-  """把项目 ORM 对象转换成项目列表行 schema。
-
-  参数：
-  - project：项目 ORM 对象。
-  - owner_name：项目所属用户账号；为空时使用 user_{owner_id}。
-  - server_ip：项目服务器 IP；为空时前端展示为未配置。
-
-  作用：
-  - 单项目健康检测接口需要复用列表行结构，避免返回字段和列表不一致。
-
-  返回：
-  - ProjectItem：包含项目基础字段、汇总字段和默认未检测状态。
-  """
-  item = schemas.pspm.ProjectItem(
-    id=project.id,
-    owner_id=project.owner_id,
-    owner=owner_name or f'user_{project.owner_id}',
-    name=project.name,
-    description=project.description,
-    server_id=project.server_id,
-    server_ip=server_ip,
-    backend_path=project.backend_path,
-    frontend_path=project.frontend_path,
-    nginx_conf_path=project.nginx_conf_path,
-    nginx_server_ip=getattr(project, 'nginx_server_ip', None),
-    nginx_config_text=getattr(project, 'nginx_config_text', None),
-    frontend_port=project.frontend_port,
-    backend_dev_port=project.backend_dev_port,
-    backend_deploy_port=project.backend_deploy_port,
-    database_name=project.database_name,
-    database_host=getattr(project, 'database_host', None),
-    database_port=getattr(project, 'database_port', None),
-    database_user=getattr(project, 'database_user', None),
-    database_password=getattr(project, 'database_password', None),
-    conda_env_name=project.conda_env_name,
-    python_version=project.python_version,
-    dev_start_command=project.dev_start_command,
-    deploy_start_command=project.deploy_start_command,
-    entry_file_path=project.entry_file_path,
-    status=crud.projects.model and crud.project_status_to_name(project.status) if False else ('运行中' if project.status == 1 else '已停止'),
-    created_at=project.created_at,
-  )
-  item.nginx_info = _join_summary_parts([
-    item.nginx_server_ip or '',
-    f'前端:{item.frontend_port}' if item.frontend_port else '',
-    f'后端:{item.backend_deploy_port}' if item.backend_deploy_port else '',
-  ])
-  item.database_info = _join_summary_parts([
-    item.database_host or '',
-    f'库:{item.database_name}' if item.database_name else '',
-  ])
-  item.project_status = '未检测'
-  item.project_status_detail = ''
-  item.service_status = item.status
-  item.running_port = ''
-  return item
-
-
-async def inspect_project_health_service(session, current_user, project_id: int) -> schemas.pspm.ProjectItem:
-  """按需检测单个项目的健康状态。
-
-  参数：
-  - session：数据库会话。
-  - current_user：当前登录用户。
-  - project_id：前端点击“检测状态”按钮时传入的项目 ID。
-
-  作用：
-  - 只检测当前项目，避免列表刷新时批量连接服务器、数据库和 Nginx 导致页面慢或整体失败。
-  - 检测项目目录、Conda 环境、数据库、Nginx 配置和服务运行端口。
-
-  返回：
-  - ProjectItem：与列表行同结构，但 project_status / project_status_detail / running_port 为本次检测结果。
-  """
-  project, _is_root = await get_project_for_user(session, project_id, current_user)
-  servers = await _list_allowed_server_rows(session, current_user)
-  server_by_id = {int(getattr(item, 'id', 0) or 0): item for item in servers.data}
-  server_by_ip = {str(getattr(item, 'ip', '') or '').strip(): item for item in servers.data}
-  server_row = server_by_id.get(int(getattr(project, 'server_id', None) or 0))
-  server_ip = str(getattr(server_row, 'ip', '') or '').strip() if server_row else ''
-
-  item = _project_schema_from_orm(project, owner_name=str(getattr(current_user, 'username', '') or ''), server_ip=server_ip or None)
-  problems: list[str] = []
-
-  if not server_row:
-    problems.append('项目服务器不可用或无权限')
-    item.service_status = '已停止'
-    item.running_port = ''
-  else:
-    runtime_data = await _inspect_project_runtime(server_row, item)
-    item.service_status = runtime_data.get('service_status') or '已停止'
-    item.running_port = runtime_data.get('running_port') or ''
-    await crud.projects.update_status(session, project_id=project_id, running=item.service_status == '运行中')
-    if item.backend_path and not await _server_path_exists(server_row, item.backend_path):
-      problems.append('项目目录不存在')
-    if item.conda_env_name and not await _server_conda_env_exists(server_row, item.conda_env_name):
-      problems.append('Conda环境不存在')
-
-  if item.database_name:
-    try:
-      host = _safe_db_host(item.database_host or '')
-      port = _safe_db_port(int(item.database_port or 3306))
-      user = _safe_db_user(item.database_user or '')
-      password = str(item.database_password or '')
-      ok, _message = await _check_server_mysql_connectable(host, port, user, password)
-      if not ok:
-        problems.append('数据库连接失败')
-      elif not await _check_database_exists(host, port, user, password, item.database_name):
-        problems.append('数据库不存在')
-    except Exception:
-      problems.append('数据库检测失败')
-
-  if item.nginx_conf_path or item.nginx_server_ip or item.frontend_port or item.backend_deploy_port:
-    nginx_row = server_by_ip.get(str(item.nginx_server_ip or '').strip()) or server_row
-    if not nginx_row:
-      problems.append('Nginx服务器不可用或无权限')
-    elif not await _is_nginx_running_on_server(nginx_row):
-      problems.append('Nginx服务未运行')
-    elif item.nginx_conf_path:
-      ok_conf = await _nginx_conf_contains_project_config(
-        nginx_row,
-        item.nginx_conf_path,
-        item.frontend_port or '',
-        item.backend_deploy_port or '',
-      )
-      if not ok_conf:
-        problems.append('Nginx配置不匹配或文件不存在')
-
-  item.project_status = '异常' if problems else '正常'
-  item.project_status_detail = '；'.join(problems)
-  item.status = item.service_status
-  return item
 

@@ -1,3 +1,8 @@
+"""接口依赖模块，提供接口层复用的鉴权、分页和数据库会话依赖。
+
+本模块只维护本文件所属层级的职责，避免接口、服务、工具和配置逻辑互相混杂。
+"""
+
 import logging
 from typing import Annotated
 
@@ -18,6 +23,10 @@ TokenDep = Annotated[str, Depends(reusable_oauth)]
 
 
 async def get_token_payload(token: str) -> schemas.token.TokenPayload:
+    """解析并校验 JWT 令牌载荷。
+
+    返回 TokenPayload；令牌无效时抛出 401。
+    """
     try:
         payload = jwt.decode(
             token,
@@ -31,6 +40,10 @@ async def get_token_payload(token: str) -> schemas.token.TokenPayload:
 
 
 async def get_current_user(token: TokenDep, db: AsyncSession = Depends(get_db)) -> schemas.users.Data:
+    """根据访问令牌查询当前用户。
+
+    从数据库读取用户记录并转换为用户响应模型。
+    """
     token_data = await get_token_payload(token)
     user = await crud.users.get(db, {'id': token_data.sub})
     if not user:
@@ -39,6 +52,10 @@ async def get_current_user(token: TokenDep, db: AsyncSession = Depends(get_db)) 
 
 
 async def get_current_active_user(current_user: schemas.users.Data = Depends(get_current_user)) -> schemas.users.Data:
+    """校验当前用户是否处于启用状态。
+
+    禁用用户会被拒绝访问。
+    """
     if not await crud.users.is_active(current_user):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Inactive User')
     return current_user
@@ -71,6 +88,10 @@ def _extract_ws_token(websocket: WebSocket) -> str:
 
 
 async def get_ws_current_user(websocket: WebSocket, db: AsyncSession = Depends(get_db)) -> schemas.users.Data:
+    """根据 WebSocket 请求令牌查询当前用户。
+
+    用于终端 WebSocket 连接鉴权。
+    """
     try:
         token = _extract_ws_token(websocket)
         payload = jwt.decode(
@@ -89,6 +110,7 @@ async def get_ws_current_user(websocket: WebSocket, db: AsyncSession = Depends(g
 
 
 async def get_ws_current_active_user(current_user: schemas.users.Data = Depends(get_ws_current_user)) -> schemas.users.Data:
+    """校验 WebSocket 当前用户是否处于启用状态。"""
     if not await crud.users.is_active(current_user):
         raise WebSocketException(status.HTTP_401_UNAUTHORIZED, 'Unauthorized')
     return current_user
@@ -99,10 +121,23 @@ CurrentWSUser = Annotated[schemas.users.Data, Depends(get_ws_current_active_user
 
 
 def require_permission(menu_key: str, action_key: str | None = None):
+    """构造菜单权限检查依赖。
+
+    参数为菜单 key 和动作 key，返回可被 FastAPI Depends 使用的权限校验器。
+    """
     async def _checker(
         current_user: schemas.users.Data = Depends(get_current_active_user),
         db: AsyncSession = Depends(get_db),
     ) -> schemas.users.Data:
+        """执行 FastAPI 权限依赖检查。
+
+        参数：
+        - current_user：当前登录用户，由登录态依赖解析得到。
+        - db：数据库会话，用于查询 RBAC 权限表。
+
+        返回：
+        - 当前用户数据；无权限时抛出 HTTP 403。
+        """
         has = await crud.rbac.has_permission(db, user_id=current_user.id, menu_key=menu_key, action_key=action_key)
         if not has:
             raise HTTPException(status_code=403, detail='无权限')

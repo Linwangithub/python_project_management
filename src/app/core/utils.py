@@ -1,3 +1,8 @@
+"""核心工具模块，存放不依赖业务模型的通用辅助函数。
+
+本模块只维护本文件所属层级的职责，避免接口、服务、工具和配置逻辑互相混杂。
+"""
+
 import logging
 from typing import Callable, Awaitable
 from app.core.deps import get_settings

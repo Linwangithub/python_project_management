@@ -1,3 +1,8 @@
+"""核心依赖模块，封装数据库会话、当前用户和配置读取等公共依赖。
+
+本模块只维护本文件所属层级的职责，避免接口、服务、工具和配置逻辑互相混杂。
+"""
+
 import logging
 from functools import cache
 from typing import Annotated, AsyncGenerator, Optional
@@ -14,13 +19,13 @@ logger = logging.getLogger(__name__)
 
 @cache
 def get_settings() -> Settings:
-    """Get settings."""
+    """获取应用配置对象。"""
     return Settings()
 
 
 @cache
 def get_helpers() -> Helpers:
-    """Get helpers."""
+    """获取通用辅助工具对象。"""
     return Helpers()
 
 
@@ -37,6 +42,10 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 
 async def get_redis() -> AsyncGenerator[Optional[AsyncRedis], None]:
+    """获取 Redis 连接依赖。
+
+    供需要 Redis 的接口通过依赖注入使用。
+    """
     if get_settings().redis.uri is None:
         yield None
         return

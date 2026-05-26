@@ -1,3 +1,8 @@
+"""项目删除服务模块，负责按删除范围清理项目目录、Conda、数据库、Nginx 和项目记录。
+
+本模块只维护本文件所属层级的职责，避免接口、服务、工具和配置逻辑互相混杂。
+"""
+
 import shlex
 from typing import List
 
@@ -10,10 +15,12 @@ from app.utils.pspm.nginx_utils import (
   _apply_nginx_conf_change_on_server,
   _get_running_nginx_conf_path_on_server,
   _is_nginx_running_on_server,
-  _remove_project_server_blocks,
 )
+from app.utils.pspm.nginx_server_blocks import _remove_project_server_blocks
 from app.utils.pspm.project_config import (
   CONDA_INIT,
+  DEFAULT_MYSQL_HOST,
+  DEFAULT_MYSQL_PORT,
   DELETE_SCOPE_OPTIONS,
   DELETE_SCOPE_PROJECT_AND_CONDA,
   DELETE_SCOPE_PROJECT_CONDA_AND_DB,
@@ -123,8 +130,8 @@ async def delete_databases_if_needed(project_rows, delete_scope: str):
     if not db_name:
       continue
     safe_name = _safe_db_identifier(db_name)
-    db_host = _safe_db_host(str(getattr(row, 'database_host', '') or 'localhost'))
-    db_port = _safe_db_port(int(str(getattr(row, 'database_port', '') or '3306')))
+    db_host = _safe_db_host(str(getattr(row, 'database_host', '') or DEFAULT_MYSQL_HOST))
+    db_port = _safe_db_port(int(str(getattr(row, 'database_port', '') or str(DEFAULT_MYSQL_PORT))))
     db_user = _safe_db_user(str(getattr(row, 'database_user', '') or 'root'))
     db_password = str(getattr(row, 'database_password', '') or '')
     await _drop_database_if_exists(db_host, db_port, db_user, db_password, safe_name)

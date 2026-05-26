@@ -1,3 +1,8 @@
+"""核心辅助模块，提供分页、响应包装和通用数据处理方法。
+
+本模块只维护本文件所属层级的职责，避免接口、服务、工具和配置逻辑互相混杂。
+"""
+
 from typing import Any
 import re
 import json
@@ -6,6 +11,7 @@ from pydantic import model_validator
 
 class Helpers:
 
+    """通用辅助工具集合。"""
     def pascal_case_to_snake_case(self, camel_case: str) -> str:
         """大驼峰（帕斯卡）转蛇形"""
         snake_case = re.sub(r"(?P<key>[A-Z])", r"_\g<key>", camel_case)
@@ -40,5 +46,5 @@ class Helpers:
 
     @model_validator(mode="after")
     def check(self) -> "Helpers":
-        """Check everything correct."""
+        """检查核心辅助工具配置是否正确。"""
         return self

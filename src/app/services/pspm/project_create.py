@@ -1,4 +1,8 @@
-import json
+"""项目创建服务模块，负责创建项目记录并按配置执行目录、Conda、数据库和 Nginx 初始化。
+
+本模块只维护本文件所属层级的职责，避免接口、服务、工具和配置逻辑互相混杂。
+"""
+
 import os
 import shlex
 from typing import List
@@ -7,17 +11,17 @@ from fastapi import HTTPException
 
 from app import crud, schemas
 from app.services.pspm.project_helpers import frontend_dist_base_dir_for_user, frontend_root_for_project
+from app.services.pspm.project_create_helpers import (
+  conda_env_exists,
+  normalize_project_create_input,
+  parse_conda_env_paths,
+)
 from app.services.pspm.project_detail import record_project_operation, snapshot_project_config
 from app.utils.pspm.db_utils import (
   _check_database_exists,
   _check_server_mysql_connectable,
   _create_database_utf8mb4,
   _drop_database_if_exists,
-  _safe_db_host,
-  _safe_db_identifier,
-  _safe_db_port,
-  _safe_db_user,
-  _safe_optional_db_name,
 )
 from app.utils.pspm.nginx_utils import (
   _apply_nginx_conf_change_on_server,
@@ -26,20 +30,31 @@ from app.utils.pspm.nginx_utils import (
   _get_running_nginx_conf_path_on_server,
   _is_nginx_running_on_server,
   _is_port_in_use_on_server,
+  _validate_requested_nginx_conf_path,
+)
+from app.utils.pspm.nginx_server_blocks import (
   _normalize_confirmed_nginx_server_block,
   _remove_project_server_blocks,
   _replace_or_append_project_server_block,
-  _validate_requested_nginx_conf_path,
 )
 from app.utils.pspm.path_utils import (
   _build_target_dir,
-  _normalize_path,
-  _safe_conda_name,
   _safe_optional_port_text,
-  _safe_project_name,
-  _safe_python_version,
 )
 from app.utils.pspm.project_config import CONDA_INIT, DEFAULT_FRONTEND_PATH
+from app.utils.pspm.project_create_messages import (
+  NGINX_PORT_REQUIRED_MESSAGE,
+  NGINX_PORT_SAME_MESSAGE,
+  NGINX_SERVER_PERMISSION_DENIED_MESSAGE,
+  NGINX_SERVICE_NOT_RUNNING_MESSAGE,
+  PROJECT_CREATE_LOG_ACTION,
+  PROJECT_CREATE_LOG_ACTION_LABEL,
+  PROJECT_CREATE_SUCCESS_STATUS,
+  PROJECT_NAME_EXISTS_MESSAGE,
+  PROJECT_SERVER_PERMISSION_DENIED_MESSAGE,
+  UNKNOWN_ERROR_MESSAGE,
+  render_project_create_message,
+)
 from app.utils.pspm.shell_utils import (
   _assert_server_ip_allowed,
   _find_server_row_by_ip,
@@ -67,7 +82,7 @@ async def create_project_record_service(session, current_user, payload: schemas.
   """
   exists = await crud.projects.get(session, obj_in={'owner_id': current_user.id, 'name': payload.name, 'status': [0, 1]})
   if exists:
-    raise HTTPException(status_code=400, detail='项目名称已存在')
+    raise HTTPException(status_code=400, detail=PROJECT_NAME_EXISTS_MESSAGE)
 
   await crud.projects.create(
     session,
@@ -123,35 +138,28 @@ async def create_project_real_service(session, current_user, payload: schemas.ps
   返回：
   - `ProjectRealCreateResponseData`，包含项目 ID、后端路径、Conda 环境、Python 版本和执行日志。
   """
-  project_name = _safe_project_name(payload.name)
-  python_version = _safe_python_version(payload.python_version)
-  conda_name = _safe_conda_name(payload.conda_env_name)
-  use_database = bool(payload.use_database)
-  database_name_input = _safe_optional_db_name(payload.database_name)
-  db_host = (payload.database_host or '').strip()
-  db_port = payload.database_port
-  db_user = (payload.database_user or '').strip()
-  db_password = str(payload.database_password or '')
-  base_path = _normalize_path(payload.base_path)
-  use_nginx = bool(payload.use_nginx)
-  server_ip = (payload.server_ip or '').strip()
-  nginx_server_ip = (payload.nginx_server_ip or server_ip).strip()
-  requested_nginx_conf_path = str(payload.nginx_conf_path or '').strip()
-  confirmed_nginx_config_text = str(payload.nginx_config_text or '').strip()
+  normalized = normalize_project_create_input(payload)
+  project_name = normalized.project_name
+  python_version = normalized.python_version
+  conda_name = normalized.conda_name
+  use_database = normalized.use_database
+  database_name = normalized.database_name
+  db_host = normalized.db_host
+  db_port = normalized.db_port
+  db_user = normalized.db_user
+  db_password = normalized.db_password
+  base_path = normalized.base_path
+  use_nginx = normalized.use_nginx
+  server_ip = normalized.server_ip
+  nginx_server_ip = normalized.nginx_server_ip
+  requested_nginx_conf_path = normalized.requested_nginx_conf_path
+  confirmed_nginx_config_text = normalized.confirmed_nginx_config_text
   _assert_server_ip_allowed(server_ip)
-
-  if use_database:
-    database_name = _safe_db_identifier(database_name_input or project_name)
-    db_host = _safe_db_host(db_host)
-    db_port = _safe_db_port(db_port)
-    db_user = _safe_db_user(db_user)
-  else:
-    database_name = ''
 
   servers = await _list_allowed_server_rows(session, current_user)
   server_row = _find_server_row_by_ip(servers, server_ip)
   if not server_row:
-    raise HTTPException(status_code=403, detail='当前用户无该服务器使用权限')
+    raise HTTPException(status_code=403, detail=PROJECT_SERVER_PERMISSION_DENIED_MESSAGE)
 
   nginx_conf_path = ''
   nginx_frontend_port = ''
@@ -165,74 +173,66 @@ async def create_project_real_service(session, current_user, payload: schemas.ps
   if use_nginx:
     nginx_server_row = _find_server_row_by_ip(servers, nginx_server_ip)
     if not nginx_server_row:
-      raise HTTPException(status_code=403, detail='当前用户无该Nginx服务器使用权限')
+      raise HTTPException(status_code=403, detail=NGINX_SERVER_PERMISSION_DENIED_MESSAGE)
 
     ping_ok, ping_msg = await _ping_from_server_to_target(server_row, nginx_server_ip)
     if not ping_ok:
-      raise HTTPException(status_code=400, detail=f'Nginx服务器不可达：{ping_msg}')
+      raise HTTPException(status_code=400, detail=render_project_create_message('nginx_unreachable', message=ping_msg))
 
     running = await _is_nginx_running_on_server(nginx_server_row)
     if not running:
-      raise HTTPException(status_code=400, detail='nginx服务未开启')
+      raise HTTPException(status_code=400, detail=NGINX_SERVICE_NOT_RUNNING_MESSAGE)
     running_conf_path = await _get_running_nginx_conf_path_on_server(nginx_server_row)
     inventory = await _collect_nginx_conf_inventory_on_server(nginx_server_row, running_conf_path)
     nginx_conf_path = _validate_requested_nginx_conf_path(requested_nginx_conf_path, inventory)
 
   exists_db = await crud.projects.get(session, obj_in={'owner_id': current_user.id, 'name': project_name, 'status': [0, 1]})
   if exists_db:
-    raise HTTPException(status_code=400, detail='项目名称已存在')
+    raise HTTPException(status_code=400, detail=PROJECT_NAME_EXISTS_MESSAGE)
 
   target_dir = _build_target_dir(base_path, project_name)
   if os.path.exists(target_dir):
-    raise HTTPException(status_code=400, detail=f'目录已存在：{target_dir}')
+    raise HTTPException(status_code=400, detail=render_project_create_message('directory_exists', path=target_dir))
 
   conda_list_cmd = f'{CONDA_INIT}; conda env list --json'
   code, out, err = await _run_shell(conda_list_cmd, timeout=120)
   if code != 0:
-    msg = err.strip() or out.strip() or 'unknown error'
-    raise HTTPException(status_code=500, detail=f'查询Conda环境失败：{msg}')
+    msg = err.strip() or out.strip() or UNKNOWN_ERROR_MESSAGE
+    raise HTTPException(status_code=500, detail=render_project_create_message('conda_query_failed', message=msg))
 
-  try:
-    conda_data = json.loads(out or '{}')
-    conda_envs = conda_data.get('envs') if isinstance(conda_data, dict) else []
-    if not isinstance(conda_envs, list):
-      conda_envs = []
-  except Exception as ex:
-    raise HTTPException(status_code=500, detail=f'解析Conda环境列表失败：{str(ex)}')
-
-  conda_suffix = f'/{conda_name}'
-  if any(str(item).rstrip('/').endswith(conda_suffix) for item in conda_envs):
-    raise HTTPException(status_code=400, detail=f'Conda环境已存在：{conda_name}')
+  conda_envs = parse_conda_env_paths(out)
+  if conda_env_exists(conda_envs, conda_name):
+    raise HTTPException(status_code=400, detail=render_project_create_message('conda_exists', name=conda_name))
 
   if use_database and database_name:
     exists = await _check_database_exists(db_host, db_port, db_user, db_password, database_name)
     if exists:
-      raise HTTPException(status_code=400, detail=f'数据库 {database_name} 已存在，创建失败')
+      raise HTTPException(status_code=400, detail=render_project_create_message('database_exists', name=database_name))
 
   if use_nginx:
     if not payload.frontend_port or not payload.backend_deploy_port:
-      raise HTTPException(status_code=400, detail='启用nginx时必须填写前端端口和后端部署端口')
+      raise HTTPException(status_code=400, detail=NGINX_PORT_REQUIRED_MESSAGE)
     nginx_frontend_port = _safe_optional_port_text(payload.frontend_port)
     nginx_backend_port = _safe_optional_port_text(payload.backend_deploy_port)
     if nginx_frontend_port == nginx_backend_port:
-      raise HTTPException(status_code=400, detail='Nginx前端端口和后端部署端口不能相同')
+      raise HTTPException(status_code=400, detail=NGINX_PORT_SAME_MESSAGE)
 
     frontend_port_int = int(nginx_frontend_port)
     backend_port_int = int(nginx_backend_port)
     if await _is_port_in_use_on_server(nginx_server_row, frontend_port_int):
-      raise HTTPException(status_code=400, detail=f'Nginx前端端口 {frontend_port_int} 已被系统占用')
+      raise HTTPException(status_code=400, detail=render_project_create_message('frontend_port_system_used', port=frontend_port_int))
     if await _is_port_in_use_on_server(nginx_server_row, backend_port_int):
-      raise HTTPException(status_code=400, detail=f'后端部署端口 {backend_port_int} 已被系统占用')
+      raise HTTPException(status_code=400, detail=render_project_create_message('backend_port_system_used', port=backend_port_int))
     frontend_conflict = await _check_nginx_port_conflict_on_server(nginx_server_row, frontend_port_int, running_conf_path, project_name=project_name)
     if frontend_conflict.get('listen'):
-      raise HTTPException(status_code=400, detail=f'Nginx前端端口 {frontend_port_int} 已在Nginx listen配置中占用')
+      raise HTTPException(status_code=400, detail=render_project_create_message('frontend_port_listen_used', port=frontend_port_int))
     if frontend_conflict.get('proxy_pass'):
-      raise HTTPException(status_code=400, detail=f'Nginx前端端口 {frontend_port_int} 已在Nginx proxy_pass配置中占用')
+      raise HTTPException(status_code=400, detail=render_project_create_message('frontend_port_proxy_used', port=frontend_port_int))
     backend_conflict = await _check_nginx_port_conflict_on_server(nginx_server_row, backend_port_int, running_conf_path, project_name=project_name)
     if backend_conflict.get('listen'):
-      raise HTTPException(status_code=400, detail=f'后端部署端口 {backend_port_int} 已在Nginx listen配置中占用')
+      raise HTTPException(status_code=400, detail=render_project_create_message('backend_port_listen_used', port=backend_port_int))
     if backend_conflict.get('proxy_pass'):
-      raise HTTPException(status_code=400, detail=f'后端部署端口 {backend_port_int} 已在Nginx proxy_pass配置中占用')
+      raise HTTPException(status_code=400, detail=render_project_create_message('backend_port_proxy_used', port=backend_port_int))
 
     confirmed_nginx_config_text = _normalize_confirmed_nginx_server_block(
       confirmed_nginx_config_text,
@@ -273,18 +273,18 @@ async def create_project_real_service(session, current_user, payload: schemas.ps
       try:
         rows = await crud.projects.remove(session, obj_in={'id': project_row_id})
         if not rows:
-          rollback_errors.append(f'回滚项目记录失败：记录不存在（id={project_row_id}）')
+          rollback_errors.append(render_project_create_message('rollback_project_record_missing', project_id=project_row_id))
         else:
-          logs.append(f'回滚：项目记录已删除（id={project_row_id}）')
+          logs.append(render_project_create_message('rollback_project_record_deleted', project_id=project_row_id))
       except Exception as ex:
-        rollback_errors.append(f'回滚项目记录失败：{str(ex)}')
+        rollback_errors.append(render_project_create_message('rollback_project_record_failed', message=str(ex)))
 
     if db_created and use_database and database_name:
       try:
         await _drop_database_if_exists(db_host, db_port, db_user, db_password, database_name)
-        logs.append(f'回滚：数据库 {database_name} 已删除')
+        logs.append(render_project_create_message('rollback_database_deleted', database_name=database_name))
       except Exception as ex:
-        rollback_errors.append(f'回滚数据库失败：{str(ex)}')
+        rollback_errors.append(render_project_create_message('rollback_database_failed', message=str(ex)))
 
     if nginx_created and use_nginx and nginx_conf_path and nginx_server_row is not None:
       try:
@@ -294,11 +294,11 @@ async def create_project_real_service(session, current_user, payload: schemas.ps
           lambda old: _remove_project_server_blocks(old, project_name)[0],
         )
         if ok_rb:
-          logs.append(f'回滚：Nginx配置已删除 {project_name}')
+          logs.append(render_project_create_message('rollback_nginx_deleted', project_name=project_name))
         else:
-          rollback_errors.append(f'回滚Nginx配置失败：{msg_rb}')
+          rollback_errors.append(render_project_create_message('rollback_nginx_failed', message=msg_rb))
       except Exception as ex:
-        rollback_errors.append(f'回滚Nginx配置失败：{str(ex)}')
+        rollback_errors.append(render_project_create_message('rollback_nginx_failed', message=str(ex)))
 
     if conda_created:
       logs.append(f'$ conda env remove -n {conda_name} -y')
@@ -306,12 +306,12 @@ async def create_project_real_service(session, current_user, payload: schemas.ps
       logs.extend(_split_lines(out_rb))
       logs.extend(_split_lines(err_rb))
       if code_rb != 0:
-        rollback_errors.append(f'回滚Conda环境失败：{err_rb.strip() or out_rb.strip() or "unknown error"}')
+        rollback_errors.append(render_project_create_message('rollback_conda_failed', message=err_rb.strip() or out_rb.strip() or UNKNOWN_ERROR_MESSAGE))
       else:
-        logs.append(f'回滚：Conda环境 {conda_name} 已删除')
+        logs.append(render_project_create_message('rollback_conda_deleted', conda_name=conda_name))
 
     if frontend_dist_created and use_nginx:
-      logs.append(f'frontend_dist base dir kept: {frontend_dist_base_dir}')
+      logs.append(render_project_create_message('frontend_dist_kept', path=frontend_dist_base_dir))
 
     if dir_created:
       logs.append(f'$ {rm_dir_cmd}')
@@ -319,9 +319,9 @@ async def create_project_real_service(session, current_user, payload: schemas.ps
       logs.extend(_split_lines(out_rb))
       logs.extend(_split_lines(err_rb))
       if code_rb != 0:
-        rollback_errors.append(f'回滚项目目录失败：{err_rb.strip() or out_rb.strip() or "unknown error"}')
+        rollback_errors.append(render_project_create_message('rollback_project_dir_failed', message=err_rb.strip() or out_rb.strip() or UNKNOWN_ERROR_MESSAGE))
       else:
-        logs.append(f'回滚：项目目录 {target_dir} 已删除')
+        logs.append(render_project_create_message('rollback_project_dir_deleted', path=target_dir))
 
     return rollback_errors
 
@@ -329,53 +329,53 @@ async def create_project_real_service(session, current_user, payload: schemas.ps
     logs.append(f'$ mkdir -p {shlex.quote(target_dir)}')
     code, out, err = await _run_shell(mkdir_cmd, timeout=60)
     if code != 0:
-      actions.append(f'创建项目目录失败：{target_dir}')
-      raise HTTPException(status_code=500, detail=f'创建项目目录失败：{err.strip() or "unknown error"}')
+      actions.append(render_project_create_message('create_project_dir_failed_action', path=target_dir))
+      raise HTTPException(status_code=500, detail=render_project_create_message('create_project_dir_failed', message=err.strip() or UNKNOWN_ERROR_MESSAGE))
     dir_created = True
-    actions.append(f'创建项目目录成功：{target_dir}')
-    logs.append(f'创建项目目录成功：{target_dir}')
+    actions.append(render_project_create_message('create_project_dir_success', path=target_dir))
+    logs.append(render_project_create_message('create_project_dir_success', path=target_dir))
 
     if use_nginx:
       logs.append(f'$ mkdir -p {shlex.quote(frontend_dist_base_dir)}')
       code, out, err = await _run_shell(mkdir_frontend_dist_cmd, timeout=60)
       if code != 0:
-        actions.append(f'创建前端打包目录失败：{frontend_dist_base_dir}')
-        raise HTTPException(status_code=500, detail=f'create frontend_dist base dir failed: {frontend_dist_base_dir} {err.strip() or "unknown error"}'.strip())
+        actions.append(render_project_create_message('create_frontend_dir_failed_action', path=frontend_dist_base_dir))
+        raise HTTPException(status_code=500, detail=render_project_create_message('create_frontend_dir_failed', path=frontend_dist_base_dir, message=err.strip() or UNKNOWN_ERROR_MESSAGE))
       frontend_dist_created = True
-      actions.append(f'创建前端打包目录成功：{frontend_dist_base_dir}')
-      logs.append(f'创建前端打包目录成功：{frontend_dist_base_dir}')
+      actions.append(render_project_create_message('create_frontend_dir_success', path=frontend_dist_base_dir))
+      logs.append(render_project_create_message('create_frontend_dir_success', path=frontend_dist_base_dir))
 
-    logs.append(f'开始创建Conda环境：{conda_name}，Python版本：{python_version}')
+    logs.append(render_project_create_message('create_conda_start', conda_name=conda_name, python_version=python_version))
     code, out, err = await _run_shell(conda_cmd, timeout=3600)
     if code != 0:
-      actions.append(f'创建Conda环境失败：{conda_name}，Python版本：{python_version}')
-      raise HTTPException(status_code=500, detail=f'创建Conda环境失败：{err.strip() or "unknown error"}')
+      actions.append(render_project_create_message('create_conda_failed_action', conda_name=conda_name, python_version=python_version))
+      raise HTTPException(status_code=500, detail=render_project_create_message('create_conda_failed', message=err.strip() or UNKNOWN_ERROR_MESSAGE))
     conda_created = True
-    actions.append(f'创建Conda环境成功：{conda_name}，Python版本：{python_version}')
-    logs.append(f'创建Conda环境成功：{conda_name}，Python版本：{python_version}')
+    actions.append(render_project_create_message('create_conda_success', conda_name=conda_name, python_version=python_version))
+    logs.append(render_project_create_message('create_conda_success', conda_name=conda_name, python_version=python_version))
 
-    logs.append(f'检查Conda环境Python版本：{conda_name}')
+    logs.append(render_project_create_message('check_python_start', conda_name=conda_name))
     code, out, err = await _run_shell(py_ver_cmd, timeout=120)
     if code != 0:
-      actions.append(f'检查Python版本失败：{conda_name}')
-      raise HTTPException(status_code=500, detail=f'Python版本验证失败：{err.strip() or "unknown error"}')
+      actions.append(render_project_create_message('check_python_failed_action', conda_name=conda_name))
+      raise HTTPException(status_code=500, detail=render_project_create_message('check_python_failed', message=err.strip() or UNKNOWN_ERROR_MESSAGE))
     python_check_text = ' '.join(_split_lines(out) + _split_lines(err)).strip() or python_version
-    actions.append(f'检查Python版本成功：{python_check_text}')
-    logs.append(f'检查Python版本成功：{python_check_text}')
+    actions.append(render_project_create_message('check_python_success', python_text=python_check_text))
+    logs.append(render_project_create_message('check_python_success', python_text=python_check_text))
 
     if use_database and database_name:
       mysql_ok, mysql_msg = await _check_server_mysql_connectable(db_host, db_port, db_user, db_password)
       if not mysql_ok:
-        actions.append(f'创建数据库失败：{database_name}，MySQL不可用')
-        raise HTTPException(status_code=500, detail=f'创建数据库失败，MySQL不可用：{mysql_msg}')
+        actions.append(render_project_create_message('create_database_failed_mysql_action', database_name=database_name))
+        raise HTTPException(status_code=500, detail=render_project_create_message('create_database_failed_mysql', message=mysql_msg))
       try:
         await _create_database_utf8mb4(db_host, db_port, db_user, db_password, database_name)
       except Exception as ex:
-        actions.append(f'创建数据库失败：{database_name}')
-        raise HTTPException(status_code=500, detail=f'创建数据库失败：{str(ex)}')
+        actions.append(render_project_create_message('create_database_failed_action', database_name=database_name))
+        raise HTTPException(status_code=500, detail=render_project_create_message('create_database_failed', message=str(ex)))
       db_created = True
-      actions.append(f'创建数据库成功：{database_name}（{db_host}:{db_port}）')
-      logs.append(f'创建数据库成功：{database_name}（{db_host}:{db_port}）')
+      actions.append(render_project_create_message('create_database_success', database_name=database_name, host=db_host, port=db_port))
+      logs.append(render_project_create_message('create_database_success', database_name=database_name, host=db_host, port=db_port))
 
     if use_nginx:
       ok_nginx, msg_nginx = await _apply_nginx_conf_change_on_server(
@@ -384,11 +384,11 @@ async def create_project_real_service(session, current_user, payload: schemas.ps
         lambda old: _replace_or_append_project_server_block(old, project_name, confirmed_nginx_config_text),
       )
       if not ok_nginx:
-        actions.append(f'写入Nginx配置失败：{nginx_conf_path}')
-        raise HTTPException(status_code=500, detail=f'创建Nginx配置失败：{msg_nginx}')
+        actions.append(render_project_create_message('write_nginx_failed_action', path=nginx_conf_path))
+        raise HTTPException(status_code=500, detail=render_project_create_message('create_nginx_failed', message=msg_nginx))
       nginx_created = True
-      actions.append(f'写入Nginx配置成功：{nginx_conf_path}，listen={nginx_frontend_port}，proxy_pass={nginx_backend_port}')
-      logs.append(f'写入Nginx配置成功：{nginx_conf_path}，listen={nginx_frontend_port}，proxy_pass={nginx_backend_port}')
+      actions.append(render_project_create_message('write_nginx_success', path=nginx_conf_path, frontend_port=nginx_frontend_port, backend_port=nginx_backend_port))
+      logs.append(render_project_create_message('write_nginx_success', path=nginx_conf_path, frontend_port=nginx_frontend_port, backend_port=nginx_backend_port))
 
     created = await crud.projects.create(
       session,
@@ -421,22 +421,22 @@ async def create_project_real_service(session, current_user, payload: schemas.ps
     )
     project_row_id = created.id
 
-    actions.append(f'创建项目记录成功：{project_name}')
-    logs.append('创建成功')
+    actions.append(render_project_create_message('create_project_record_success', project_name=project_name))
+    logs.append(PROJECT_CREATE_SUCCESS_STATUS)
     await record_project_operation(
       session,
       created,
       current_user,
-      action='create',
-      action_label='创建项目',
-      summary=f'创建项目：{project_name}',
+      action=PROJECT_CREATE_LOG_ACTION,
+      action_label=PROJECT_CREATE_LOG_ACTION_LABEL,
+      summary=render_project_create_message('create_project_summary', project_name=project_name),
       before_data=None,
       after_data=snapshot_project_config(created, {'server_ip': str(server_row.ip or '')}),
       detail={'actions': actions},
     )
     return schemas.pspm.ProjectRealCreateResponseData(
       project_id=created.id,
-      status='创建成功',
+      status=PROJECT_CREATE_SUCCESS_STATUS,
       backend_path=target_dir,
       conda_env_name=conda_name,
       python_version=python_version,
@@ -445,12 +445,12 @@ async def create_project_real_service(session, current_user, payload: schemas.ps
   except HTTPException as ex:
     rollback_errors = await rollback_all()
     if rollback_errors:
-      detail = f'{str(ex.detail)}；回滚异常：{" | ".join(rollback_errors)}'
+      detail = render_project_create_message('rollback_failed_suffix', message=str(ex.detail), rollback_errors=' | '.join(rollback_errors))
       raise HTTPException(status_code=ex.status_code, detail=detail)
     raise
   except Exception as ex:
     rollback_errors = await rollback_all()
-    detail = f'创建项目失败：{str(ex)}'
+    detail = render_project_create_message('create_project_failed', message=str(ex))
     if rollback_errors:
-      detail = f'{detail}；回滚异常：{" | ".join(rollback_errors)}'
+      detail = render_project_create_message('rollback_failed_suffix', message=detail, rollback_errors=' | '.join(rollback_errors))
     raise HTTPException(status_code=500, detail=detail)

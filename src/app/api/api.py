@@ -1,3 +1,8 @@
+"""接口聚合模块，负责组合业务路由并暴露统一 API Router。
+
+本模块只维护本文件所属层级的职责，避免接口、服务、工具和配置逻辑互相混杂。
+"""
+
 from fastapi import APIRouter
 
 from app.api.auth import login, user

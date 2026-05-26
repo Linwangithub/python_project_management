@@ -1,4 +1,4 @@
-"""Logging configuration for the project."""
+"""项目日志配置模块。"""
 
 import os
 from logging.config import dictConfig
@@ -10,7 +10,7 @@ log_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__)
 os.makedirs(log_dir, exist_ok=True)
 
 def configure_logging(project_log_level: LOG_LEVEL_TYPE = "INFO") -> None:
-    """Configure logging for the project."""
+    """初始化项目日志输出配置。"""
     dictConfig(
         {
             "version": 1,

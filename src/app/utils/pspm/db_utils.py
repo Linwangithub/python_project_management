@@ -1,9 +1,14 @@
+"""数据库工具模块，封装 MySQL 连接、库名检测和数据库创建删除操作。
+
+本模块只维护本文件所属层级的职责，避免接口、服务、工具和配置逻辑互相混杂。
+"""
+
 from fastapi import HTTPException
 from sqlalchemy import text as sa_text
 from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from app.utils.pspm.project_config import SAFE_IDENTIFIER_RE
+from app.utils.pspm.project_config import NETWORK_PORT_MAX, NETWORK_PORT_MIN, SAFE_IDENTIFIER_RE
 
 
 def _safe_optional_db_name(name: str) -> str:
@@ -79,7 +84,7 @@ def _safe_db_port(port: int | None) -> int:
   """
   if port is None:
     raise HTTPException(status_code=400, detail='数据库端口不能为空')
-  if port <= 0 or port > 65535:
+  if port < NETWORK_PORT_MIN or port > NETWORK_PORT_MAX:
     raise HTTPException(status_code=400, detail='数据库端口范围不合法')
   return int(port)
 

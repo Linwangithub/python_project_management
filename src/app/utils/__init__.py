@@ -1,1 +1,1 @@
-"""Common utilities package."""
+"""通用工具函数包。"""

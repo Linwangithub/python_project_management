@@ -1,3 +1,8 @@
+"""权限 CRUD 模块，封装角色、菜单和权限相关数据访问逻辑。
+
+本模块只维护本文件所属层级的职责，避免接口、服务、工具和配置逻辑互相混杂。
+"""
+
 from __future__ import annotations
 
 from typing import Dict, List, Optional, Set
@@ -13,11 +18,33 @@ USER_ROLE_KEY = 'user'
 
 
 class RbacCRUD:
+    """RBAC 权限相关 CRUD 适配器。"""
     async def get_role_by_key(self, db: AsyncSession, *, role_key: str) -> Optional[models.rbac.RbacRole]:
+        """
+        按角色 key 查询启用状态的角色。
+        
+        参数：
+        - db：数据库会话。
+        - role_key：角色唯一标识。
+        
+        返回：
+        - 角色 ORM 对象；不存在时返回 None。
+        """
         stmt = select(models.rbac.RbacRole).where(models.rbac.RbacRole.role_key == role_key, models.rbac.RbacRole.status == 1)
         return (await db.execute(stmt)).scalar_one_or_none()
 
     async def bind_user_role(self, db: AsyncSession, *, user_id: int, role_id: int) -> None:
+        """
+        绑定用户与角色。
+        
+        参数：
+        - db：数据库会话。
+        - user_id：用户 ID。
+        - role_id：角色 ID。
+        
+        作用：
+        - 已存在但禁用的绑定会重新启用；不存在时新建绑定。
+        """
         stmt = select(models.rbac.RbacUserRole).where(
             models.rbac.RbacUserRole.user_id == user_id,
             models.rbac.RbacUserRole.role_id == role_id,
@@ -35,6 +62,16 @@ class RbacCRUD:
         await db.commit()
 
     async def get_user_roles(self, db: AsyncSession, *, user_id: int) -> List[models.rbac.RbacRole]:
+        """
+        查询用户拥有的有效角色列表。
+        
+        参数：
+        - db：数据库会话。
+        - user_id：用户 ID。
+        
+        返回：
+        - 角色 ORM 对象列表。
+        """
         stmt = (
             select(models.rbac.RbacRole)
             .join(models.rbac.RbacUserRole, models.rbac.RbacUserRole.role_id == models.rbac.RbacRole.id)
@@ -48,14 +85,44 @@ class RbacCRUD:
         return list((await db.execute(stmt)).scalars().all())
 
     async def get_user_role_keys(self, db: AsyncSession, *, user_id: int) -> List[str]:
+        """
+        查询用户角色 key 列表。
+        
+        参数：
+        - db：数据库会话。
+        - user_id：用户 ID。
+        
+        返回：
+        - 角色 key 字符串列表。
+        """
         roles = await self.get_user_roles(db, user_id=user_id)
         return [r.role_key for r in roles]
 
     async def is_root_user(self, db: AsyncSession, *, user_id: int) -> bool:
+        """
+        判断用户是否拥有 root 角色。
+        
+        参数：
+        - db：数据库会话。
+        - user_id：用户 ID。
+        
+        返回：
+        - True 表示 root 用户，否则为 False。
+        """
         role_keys = await self.get_user_role_keys(db, user_id=user_id)
         return ROOT_ROLE_KEY in role_keys
 
     async def get_user_permission_rows(self, db: AsyncSession, *, user_id: int) -> List[models.rbac.RbacPermission]:
+        """
+        查询用户通过角色获得的有效权限行。
+        
+        参数：
+        - db：数据库会话。
+        - user_id：用户 ID。
+        
+        返回：
+        - 去重后的权限 ORM 对象列表。
+        """
         stmt = (
             select(models.rbac.RbacPermission)
             .join(models.rbac.RbacRolePermission, models.rbac.RbacRolePermission.permission_id == models.rbac.RbacPermission.id)
@@ -77,6 +144,16 @@ class RbacCRUD:
         return list(uniq.values())
 
     async def get_user_permission_snapshot(self, db: AsyncSession, *, user: schemas.users.Data) -> schemas.rbac.UserPermissionData:
+        """
+        构建前端需要的用户权限快照。
+        
+        参数：
+        - db：数据库会话。
+        - user：当前用户数据。
+        
+        返回：
+        - 包含角色、菜单、动作权限的 UserPermissionData。
+        """
         roles = await self.get_user_roles(db, user_id=user.id)
         role_keys = [r.role_key for r in roles]
 
@@ -112,6 +189,18 @@ class RbacCRUD:
         )
 
     async def has_permission(self, db: AsyncSession, *, user_id: int, menu_key: str, action_key: Optional[str] = None) -> bool:
+        """
+        判断用户是否拥有指定菜单或动作权限。
+        
+        参数：
+        - db：数据库会话。
+        - user_id：用户 ID。
+        - menu_key：菜单权限 key。
+        - action_key：动作权限 key；为空时检查菜单可见权限。
+        
+        返回：
+        - True 表示有权限，否则 False。
+        """
         stmt = (
             select(models.rbac.RbacPermission.id)
             .join(models.rbac.RbacRolePermission, models.rbac.RbacRolePermission.permission_id == models.rbac.RbacPermission.id)

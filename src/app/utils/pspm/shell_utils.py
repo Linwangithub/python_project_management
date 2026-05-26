@@ -1,3 +1,8 @@
+"""Shell 工具模块，封装本机和远程服务器命令执行、SSH 连接和输出处理。
+
+本模块只维护本文件所属层级的职责，避免接口、服务、工具和配置逻辑互相混杂。
+"""
+
 import asyncio
 import ipaddress
 import re
@@ -8,7 +13,14 @@ from typing import List
 from fastapi import HTTPException
 
 from app import crud
-from app.utils.pspm.project_config import LOCAL_SERVER_IPS
+from app.utils.pspm.project_config import LOCAL_SERVER_IPS, SSH_ASKPASS_TEMPLATE
+from app.utils.pspm.shell_config import (
+  PING_OK_MESSAGE,
+  SAFE_HOST_RE,
+  SSH_BATCH_MODE_OPTION,
+  SSH_DEFAULT_OPTIONS,
+  render_shell_error,
+)
 
 
 def _list_local_ips() -> set[str]:
@@ -24,7 +36,9 @@ def _list_local_ips() -> set[str]:
   返回：
   - IP 集合，包含回环地址、配置兜底地址和 hostname 解析出的地址。
   """
+  # LOCAL_SERVER_IPS 是配置兜底，后面再叠加系统实际网卡地址。
   ips = {str(x or '').strip() for x in LOCAL_SERVER_IPS if str(x or '').strip()}
+  # 回环地址和 localhost 永远视为本机，避免本机操作绕远端 SSH。
   ips.update({'127.0.0.1', '::1', 'localhost'})
   try:
     ips.update(socket.gethostbyname_ex(socket.gethostname())[2] or [])
@@ -95,6 +109,7 @@ async def _list_local_ips_async() -> set[str]:
     "ip -o -6 addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 || true",
   ]
   for command in commands:
+    # 同时兼容 hostname -I 和 ip addr 两类输出，提升不同 Linux 发行版下的本机识别准确性。
     code, out, _err = await _run_shell(command, timeout=5)
     if code != 0:
       continue
@@ -154,7 +169,7 @@ def _assert_server_ip_allowed(server_ip: str):
   """
   if (server_ip or '').strip() in _list_local_ips():
     return
-  raise HTTPException(status_code=400, detail=f'当前后端仅支持本机执行，暂不支持服务器 {server_ip}')
+  raise HTTPException(status_code=400, detail=render_shell_error('local_only', server_ip=server_ip))
 
 
 def _is_local_server_ip(server_ip: str) -> bool:
@@ -188,6 +203,7 @@ async def _shell_command_exists(command_name: str) -> bool:
   返回：
   - True 表示命令存在。
   """
+  # 命令名来自后端固定调用，但仍做 quote，保持工具函数边界安全。
   safe_name = shlex.quote(str(command_name or '').strip())
   if not safe_name:
     return False
@@ -201,7 +217,7 @@ def _build_ssh_askpass_command(password: str, ssh_opts: str, remote: str, quoted
   参数：
   - password：服务器管理中保存的 root 密码。
   - ssh_opts：统一的 SSH 选项。
-  - remote：SSH 目标，例如 `root@192.168.31.130`。
+  - remote：SSH 目标，例如 `root@server-ip`。
   - quoted_command：已经 shell quote 后的远端命令。
 
   作用：
@@ -211,10 +227,12 @@ def _build_ssh_askpass_command(password: str, ssh_opts: str, remote: str, quoted
   返回：
   - 可交给 `_run_shell` 执行的 bash 命令字符串。
   """
+  # OpenSSH 禁止从普通 stdin 读取密码，SSH_ASKPASS 可以在无 tty 场景下提供密码。
+  # 这里生成一次性脚本，并通过 trap 在命令结束后删除。
   askpass_body = f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(str(password or ''))}\n"
   askpass_body_quoted = shlex.quote(askpass_body)
   return (
-    'askpass_script=$(mktemp /tmp/pspm_askpass_XXXXXX) || exit 90; '
+    f'askpass_script=$(mktemp {SSH_ASKPASS_TEMPLATE}) || exit 90; '
     'trap \'rm -f "$askpass_script"\' EXIT; '
     f'printf %s {askpass_body_quoted} > "$askpass_script"; '
     'chmod 700 "$askpass_script"; '
@@ -238,29 +256,35 @@ async def _run_server_shell(server_row, command: str, timeout: int = 60) -> tupl
   返回：
   - `(exit_code, stdout, stderr)`。
   """
+  # server_row 来自服务器管理表，所有远程操作都必须先通过数据库记录拿到目标 IP。
   ip = str(getattr(server_row, 'ip', '') or '').strip()
   if not ip:
-    return 2, '', '服务器IP不能为空'
+    return 2, '', render_shell_error('server_ip_required')
+  # 如果目标就是后端本机，直接本地执行，避免要求本机也配置 SSH 登录自己。
   if await _is_local_server_ip_async(ip):
     return await _run_shell(command, timeout=timeout)
 
-  if not re.match(r'^[A-Za-z0-9_.:-]+$', ip):
-    return 2, '', f'服务器IP格式不合法：{ip}'
+  if not SAFE_HOST_RE.match(ip):
+    return 2, '', render_shell_error('server_ip_invalid', ip=ip)
 
+  # 远端服务器统一走 root 账号；密码来自服务器管理菜单保存的配置。
   password = str(getattr(server_row, 'root_password', '') or '')
-  ssh_opts = '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 -o LogLevel=ERROR'
+  # SSH_DEFAULT_OPTIONS 集中控制 StrictHostKeyChecking、连接超时等参数，避免各处硬编码。
+  ssh_opts = SSH_DEFAULT_OPTIONS
   remote = f'root@{shlex.quote(ip)}'
   quoted_command = shlex.quote(command)
 
   if password:
+    # 优先使用 sshpass；若后端未安装 sshpass，则回退到 SSH_ASKPASS 方案，避免强制远端安装额外工具。
     if await _shell_command_exists('sshpass'):
       shell_cmd = f'sshpass -p {shlex.quote(password)} ssh {ssh_opts} {remote} {quoted_command}'
     elif await _shell_command_exists('setsid'):
       shell_cmd = _build_ssh_askpass_command(password, ssh_opts, remote, quoted_command)
     else:
-      return 127, '', '当前后端未安装sshpass，且缺少setsid，无法使用root密码进行非交互SSH检测'
+      return 127, '', render_shell_error('ssh_password_tool_missing')
   else:
-    shell_cmd = f'ssh {ssh_opts} -o BatchMode=yes {remote} {quoted_command}'
+    # 没有密码时按密钥登录处理，并启用 BatchMode，防止接口卡在交互式密码输入。
+    shell_cmd = f'ssh {ssh_opts} {SSH_BATCH_MODE_OPTION} {remote} {quoted_command}'
 
   return await _run_shell(shell_cmd, timeout=timeout)
 
@@ -281,19 +305,19 @@ async def _ping_from_server_to_target(source_server_row, target_ip: str) -> tupl
   """
   target = str(target_ip or '').strip()
   if not target:
-    return False, '目标IP不能为空'
+    return False, render_shell_error('target_ip_required')
   if str(getattr(source_server_row, 'ip', '') or '').strip() == target:
-    return True, 'ok'
-  if not re.match(r'^[A-Za-z0-9_.:-]+$', target):
-    return False, f'目标IP格式不合法：{target}'
+    return True, PING_OK_MESSAGE
+  if not SAFE_HOST_RE.match(target):
+    return False, render_shell_error('target_ip_invalid', ip=target)
   code, out, err = await _run_server_shell(
     source_server_row,
     f'ping -c 1 -W 2 {shlex.quote(target)} >/dev/null 2>&1',
     timeout=15,
   )
   if code == 0:
-    return True, 'ok'
-  return False, (err.strip() or out.strip() or 'ping不通')
+    return True, PING_OK_MESSAGE
+  return False, (err.strip() or out.strip() or render_shell_error('ping_failed'))
 
 
 async def _list_allowed_server_rows(session, current_user):

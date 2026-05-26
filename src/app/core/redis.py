@@ -1,3 +1,8 @@
+"""Redis 连接模块，封装缓存客户端创建与连接配置。
+
+本模块只维护本文件所属层级的职责，避免接口、服务、工具和配置逻辑互相混杂。
+"""
+
 import logging
 from typing import AsyncGenerator
 from pydantic_core import MultiHostUrl

@@ -1,3 +1,8 @@
+"""路径工具模块，封装项目路径校验、路径拼接和 shell 路径安全处理。
+
+本模块只维护本文件所属层级的职责，避免接口、服务、工具和配置逻辑互相混杂。
+"""
+
 import os
 
 from fastapi import HTTPException
@@ -185,7 +190,7 @@ def _build_target_dir(base_path: str, project_name: str) -> str:
   """拼接项目最终目录。
 
   参数：
-  - base_path：项目基础目录，例如 `/root/project`。
+  - base_path：项目基础目录，例如“项目基础路径配置值”。
   - project_name：项目名称。
 
   返回：

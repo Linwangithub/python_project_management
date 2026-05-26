@@ -1,3 +1,8 @@
+"""用户权限接口模块，处理用户列表、用户创建和权限相关操作。
+
+本模块只维护本文件所属层级的职责，避免接口、服务、工具和配置逻辑互相混杂。
+"""
+
 from typing import Any, List
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
@@ -17,6 +22,10 @@ async def _index_(
     page: int = Query(1, description='页码'),
     page_size: int = Query(20, description='每页数量'),
 ) -> schemas.users.ItemsResponse:
+    """分页查询用户列表接口。
+
+    支持用户管理页面加载用户数据。
+    """
     obj_in = {}
     result = await crud.users.get_multi(session, obj_in=obj_in, page=page, page_size=page_size)
 
@@ -35,6 +44,7 @@ async def _view_(
     current_user = Depends(require_permission('user_management', None)),
     id: int = Query(..., description='用户ID'),
 ) -> Any:
+    """查询单个用户详情接口。"""
     obj_in = {'id': id}
     result = await crud.users.get(session, obj_in)
     if result:
@@ -50,6 +60,10 @@ async def _create_(
     username: str = Body(..., description='用户名'),
     password: str = Body(..., description='密码'),
 ) -> Any:
+    """创建用户接口。
+
+    写入用户基础信息并绑定角色。
+    """
     if await crud.users.get(session, obj_in={'username': username}):
         raise HTTPException(status_code=400, detail='该用户已存在，请重新填写用户名称')
 
@@ -82,6 +96,7 @@ async def _update_(
     id: int = Query(..., description='用户ID'),
     username: str = Body(..., description='用户名'),
 ) -> Any:
+    """更新用户基础信息接口。"""
     result = await crud.users.get(session, obj_in={'id': id})
     if not result:
         raise HTTPException(status_code=400, detail='用户不存在')
@@ -105,6 +120,7 @@ async def _update_password_(
     password: str = Body(..., description='密码'),
     password_confirmation: str = Body(..., description='确认密码'),
 ) -> Any:
+    """管理员重置用户密码接口。"""
     if password != password_confirmation:
         raise HTTPException(status_code=400, detail='密码与确认密码不一致')
     result = await crud.users.update(session, obj_in={'id': id}, data_in={'password': password})
@@ -120,6 +136,7 @@ async def _delete_(
     current_user = Depends(require_permission('user_management', 'delete')),
     id: List[int] = Query(..., description='用户ID'),
 ) -> Any:
+    """删除用户接口。"""
     obj_in = {'id': id}
     result = await crud.users.remove(session, obj_in=obj_in)
     if result:

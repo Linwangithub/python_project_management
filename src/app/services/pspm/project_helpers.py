@@ -1,3 +1,8 @@
+"""项目服务辅助模块，提供项目配置快照、日志记录和差异描述等复用能力。
+
+本模块只维护本文件所属层级的职责，避免接口、服务、工具和配置逻辑互相混杂。
+"""
+
 import os
 import shlex
 
@@ -5,7 +10,7 @@ from fastapi import HTTPException
 
 from app import crud, schemas
 from app.utils.pspm.path_utils import _safe_conda_name
-from app.utils.pspm.project_config import CONDA_INIT
+from app.utils.pspm.project_config import CONDA_INIT, FORBIDDEN_PROJECT_DELETE_PATHS, FRONTEND_DIST_BASE_DIR
 from app.utils.pspm.shell_utils import _run_server_shell, _split_lines
 
 
@@ -18,7 +23,7 @@ def frontend_dist_base_dir_for_user(current_user, is_root: bool) -> str:
 
   作用：
   - 创建或设置 Nginx 时，Nginx server block 的 `root` 需要指向前端打包目录。
-  - 所有用户统一使用 `/data/frontend_dist`，避免 Nginx 访问 `/root` 权限受限。
+  - 所有用户统一使用配置中的前端打包资源根目录，避免 Nginx 访问用户私有目录权限受限。
   - 普通用户也使用同一公共静态资源根目录，项目名仍作为下一级目录。
 
   返回：
@@ -30,7 +35,7 @@ def frontend_dist_base_dir_for_user(current_user, is_root: bool) -> str:
   """
   username = str(getattr(current_user, 'username', '') or 'root').strip() or 'root'
   safe_username = ''.join(ch if (ch.isalnum() or ch in {'_', '-'}) else '_' for ch in username)
-  return '/data/frontend_dist'
+  return FRONTEND_DIST_BASE_DIR
 
 
 def frontend_root_for_project(current_user, is_root: bool, project_name: str) -> str:
@@ -46,7 +51,7 @@ def frontend_root_for_project(current_user, is_root: bool, project_name: str) ->
   - 在项目表 `frontend_path` 字段中保存该项目的前端打包路径。
 
   返回：
-  - `/data/frontend_dist/{project_name}`。
+  - “前端打包资源根目录/项目名”。
   """
   base_dir = frontend_dist_base_dir_for_user(current_user, is_root)
   safe_project_name = str(project_name or '').strip().strip('/')
@@ -86,10 +91,10 @@ def parse_conda_envs_dir(conda_info_text: str) -> str:
 
   作用：
   - 前端设置项目时，需要下拉展示服务器已有 Conda 环境。
-  - 本函数从 `envs directories : /root/miniforge3/envs` 这一行解析目录。
+  - 本函数从 `envs directories` 这一行解析 Conda 环境目录。
 
   返回：
-  - 解析成功返回环境目录，例如 `/root/miniforge3/envs`。
+  - 解析成功返回实际 Conda 环境目录。
   - 解析失败返回空字符串，由调用方决定如何报错。
 
   被使用位置：
@@ -131,7 +136,7 @@ async def list_conda_env_names_on_server(server_row) -> list[str]:
   """
   code, out, err = await _run_server_shell(server_row, f'{CONDA_INIT}; conda info', timeout=120)
   if code != 0:
-    raise HTTPException(status_code=500, detail=f'查询Conda信息失败：{err.strip() or out.strip() or "unknown error"}')
+    raise HTTPException(status_code=500, detail=f'查询Conda信息失败：{err.strip() or out.strip() or '未知错误'}')
 
   envs_dir = parse_conda_envs_dir(out)
   if not envs_dir:
@@ -144,7 +149,7 @@ async def list_conda_env_names_on_server(server_row) -> list[str]:
     timeout=120,
   )
   if code_ls != 0:
-    raise HTTPException(status_code=500, detail=f'查询Conda环境列表失败：{err_ls.strip() or out_ls.strip() or "unknown error"}')
+    raise HTTPException(status_code=500, detail=f'查询Conda环境列表失败：{err_ls.strip() or out_ls.strip() or '未知错误'}')
   return [x.strip() for x in _split_lines(out_ls) if x.strip()]
 
 
@@ -185,7 +190,7 @@ def ensure_safe_project_delete_path(path: str) -> str:
   - path：项目后端目录，来自项目表 `backend_path` 字段。
 
   作用：
-  - 删除项目时会执行 `rm -rf`，必须禁止删除 `/`、`/root`、`/home`、`/root/project` 等高危路径。
+  - 删除项目时会执行 `rm -rf`，必须禁止删除根目录、用户主目录、项目根目录等高危路径。
   - 保证只删除具体项目目录，避免误删系统目录。
 
   返回：
@@ -200,7 +205,7 @@ def ensure_safe_project_delete_path(path: str) -> str:
   backend_path = os.path.normpath(str(path or '').strip()) if path else ''
   if not backend_path:
     return ''
-  if (not backend_path.startswith('/')) or backend_path in {'/', '/root', '/home', '/root/project'}:
+  if (not backend_path.startswith('/')) or backend_path in FORBIDDEN_PROJECT_DELETE_PATHS:
     raise HTTPException(status_code=400, detail=f'项目路径不安全，拒绝删除：{backend_path}')
   if backend_path.count('/') < 2:
     raise HTTPException(status_code=400, detail=f'项目路径层级过浅，拒绝删除：{backend_path}')

@@ -1,4 +1,4 @@
-"""Configuration."""
+"""应用配置定义模块。"""
 
 import logging
 import secrets
@@ -8,11 +8,13 @@ from pydantic import BaseModel, SecretStr, field_validator, model_validator
 from pydantic_core import MultiHostUrl
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.utils.pspm.project_config import ROOT_PROJECT_BASE_DIR, USER_PROJECT_BASE_PATH_TEMPLATE
+
 logger = logging.getLogger(__name__)
 
 
 class SettingsDev(BaseModel):
-    """Developer settings."""
+    """开发调试相关配置。"""
 
     environment: str = "development"
     project_name: str = "FastAPI Template"
@@ -26,23 +28,32 @@ class SettingsDev(BaseModel):
     @field_validator("openapi_url")
     @classmethod
     def check_openapi_url(cls, value: str | None) -> str | None:
-        """Convert empty string to None."""
+        """把空字符串形式的 OpenAPI 地址转换为 None。"""
         if value == "":
             return None
         return value
 
 
 class SettingsProjectPaths(BaseModel):
-    """Project path defaults for different roles."""
+    """不同用户角色对应的项目默认路径配置。"""
 
-    root_base_path: str = "/root/project"
-    user_base_path_template: str = "/home/{username}/project"
+    root_base_path: str = ROOT_PROJECT_BASE_DIR
+    user_base_path_template: str = USER_PROJECT_BASE_PATH_TEMPLATE
 
     model_config = SettingsConfigDict(frozen=True)
 
     @field_validator("root_base_path")
     @classmethod
     def check_root_base_path(cls, value: str) -> str:
+        """
+        校验 root 角色默认项目根路径。
+        
+        参数：
+        - value：环境变量或默认配置传入的路径。
+        
+        返回：
+        - 去除末尾斜杠后的绝对路径。
+        """
         path = (value or "").strip()
         if not path:
             raise ValueError("project root base path cannot be empty")
@@ -55,6 +66,15 @@ class SettingsProjectPaths(BaseModel):
     @field_validator("user_base_path_template")
     @classmethod
     def check_user_base_path_template(cls, value: str) -> str:
+        """
+        校验普通用户项目根路径模板。
+        
+        参数：
+        - value：包含 `{username}` 占位符的路径模板。
+        
+        返回：
+        - 去除末尾斜杠后的模板路径。
+        """
         template = (value or "").strip()
         if not template:
             raise ValueError("project user base path template cannot be empty")
@@ -69,7 +89,7 @@ class SettingsProjectPaths(BaseModel):
 
 
 class SettingsAuth0(BaseModel):
-    """JWT/Auth settings."""
+    """JWT 和认证相关配置。"""
 
     domain: SecretStr | None = None
     audience: SecretStr | None = None
@@ -82,15 +102,32 @@ class SettingsAuth0(BaseModel):
 
 
 class SettingsAPI(BaseModel):
-    """API settings."""
+    """API 路由和文档相关配置。"""
 
     auth0: SettingsAuth0 = SettingsAuth0()
 
     model_config = SettingsConfigDict(frozen=True, extra="ignore")
 
 
+class SettingsCORS(BaseModel):
+    """CORS middleware settings.
+
+    allow_origins 默认用于本地开发和历史联调环境；生产环境可通过环境变量覆盖。
+    """
+
+    allow_origins: list[str] = [
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://192.168.93.129:5173",
+        "http://192.168.93.129:8000",
+        "http://192.168.93.129:8888",
+    ]
+
+    model_config = SettingsConfigDict(frozen=True)
+
+
 class SettingsS3(BaseModel):
-    """S3-compatible object storage settings."""
+    """兼容 S3 协议的对象存储配置。"""
 
     bucket: str = ""
     endpoint: str | None = None
@@ -105,7 +142,7 @@ class SettingsS3(BaseModel):
 
 
 class SettingsAWS(BaseModel):
-    """AWS/S3 settings."""
+    """AWS/S3 对象存储聚合配置。"""
 
     s3: SettingsS3 = SettingsS3()
 
@@ -113,7 +150,7 @@ class SettingsAWS(BaseModel):
 
 
 class SettingsDB(BaseModel):
-    """Async database settings."""
+    """异步数据库连接配置。"""
 
     scheme: str = "mysql+aiomysql"
     host: str | None = None
@@ -127,7 +164,7 @@ class SettingsDB(BaseModel):
 
     @property
     def uri(self) -> MultiHostUrl:
-        """Generate the database URI."""
+        """生成数据库连接 URI。"""
         if self.host is None or self.username is None or self.password is None or self.database is None:
             raise ValueError("'host', 'username', 'password', and 'database' must be supplied.")
         return MultiHostUrl.build(
@@ -140,7 +177,7 @@ class SettingsDB(BaseModel):
 
 
 class SettingsRedis(BaseModel):
-    """Async Redis settings."""
+    """异步 Redis 连接配置。"""
 
     scheme: str = "redis"
     host: str | None = None
@@ -153,7 +190,7 @@ class SettingsRedis(BaseModel):
 
     @property
     def uri(self) -> MultiHostUrl | None:
-        """Generate the Redis URI. Return None when Redis is not configured."""
+        """生成 Redis 连接 URI；未配置 Redis 时返回 None。"""
         if self.host is None:
             return None
         return MultiHostUrl.build(
@@ -166,7 +203,7 @@ class SettingsRedis(BaseModel):
 
 
 class Settings(BaseSettings):
-    """All settings loaded from environment variables and .env."""
+    """从环境变量和 .env 文件加载的完整应用配置。"""
 
     api: SettingsAPI = SettingsAPI()
     aws: SettingsAWS = SettingsAWS()
@@ -174,6 +211,7 @@ class Settings(BaseSettings):
     db: SettingsDB = SettingsDB()
     redis: SettingsRedis = SettingsRedis()
     project_paths: SettingsProjectPaths = SettingsProjectPaths()
+    cors: SettingsCORS = SettingsCORS()
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -184,5 +222,5 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def check(self) -> "Settings":
-        """Validate settings."""
+        """校验应用配置项是否满足启动要求。"""
         return self

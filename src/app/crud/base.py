@@ -1,3 +1,8 @@
+"""基础 CRUD 模块，封装模型通用增删改查能力。
+
+本模块只维护本文件所属层级的职责，避免接口、服务、工具和配置逻辑互相混杂。
+"""
+
 from typing import Any, Dict, Generic, Optional, Type, TypeVar, Union, List, Literal
 from pydantic import BaseModel
 from sqlalchemy.sql import func, delete, update
@@ -13,14 +18,15 @@ UpdateSchemaType = TypeVar("UpdateSchemaType", bound=BaseModel)
 
 
 class CRUDBase(Generic[ModelType, CreateSchemaType, UpdateSchemaType]):
+    """通用 CRUD 基类。
+
+    封装列表、详情、创建、更新、删除等数据库操作。
+    """
     def __init__(self, model: Type[ModelType]):
-        """
-        CRUD object with default methods to Create, Read, Update, Delete (CRUD).
+        """初始化 CRUD 基类。
 
-        **Parameters**
-
-        * `model`: A SQLAlchemy model class
-        * `schema`: A Pydantic model (schema) class
+        参数：
+        - model：SQLAlchemy 模型类，用于后续通用数据库操作。
         """
         self.model = model
 
@@ -85,6 +91,16 @@ class CRUDBase(Generic[ModelType, CreateSchemaType, UpdateSchemaType]):
         return result.scalar_one() > 0
 
     async def get(self, db: AsyncSession, obj_in: Dict[str, Any]) -> Optional[ModelType]:
+        """
+        按条件查询单条模型记录。
+        
+        参数：
+        - db：数据库会话。
+        - obj_in：过滤条件字典。
+        
+        返回：
+        - 匹配到的 ORM 对象；不存在时返回 None。
+        """
         try:
             query = select(self.model)
             conditions = self.filters(obj_in)
@@ -96,6 +112,16 @@ class CRUDBase(Generic[ModelType, CreateSchemaType, UpdateSchemaType]):
             raise e
 
     async def get_total(self, db: AsyncSession, obj_in: Optional[Dict[str, Any]] = None) -> int:
+        """
+        按条件统计模型记录总数。
+        
+        参数：
+        - db：数据库会话。
+        - obj_in：过滤条件字典，可为空。
+        
+        返回：
+        - 匹配条件的记录数量。
+        """
         try:
             query = select(func.count()).select_from(self.model)
             conditions = self.filters(obj_in)
@@ -107,6 +133,19 @@ class CRUDBase(Generic[ModelType, CreateSchemaType, UpdateSchemaType]):
             raise e
 
     async def get_multi(self, db: AsyncSession, *, obj_in: Optional[Dict[str, Any]] = None, page: int = 1, page_size: int = 20, page_break: bool = False, sort: Literal['asc', 'desc'] = 'desc') -> List[ModelType]:
+        """
+        按条件分页查询模型记录列表。
+        
+        参数：
+        - db：数据库会话。
+        - obj_in：过滤条件字典。
+        - page/page_size：分页参数。
+        - page_break：为 True 时不分页。
+        - sort：按 id 升序或降序。
+        
+        返回：
+        - ORM 对象列表。
+        """
         try:
             query = select(self.model)
             conditions = self.filters(obj_in)
