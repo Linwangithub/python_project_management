@@ -20,6 +20,7 @@ from app.utils.pspm.runtime_helpers import (
   MSG_FRONT,
   MSG_NOT_RUNNING,
   MSG_NO_PROCESS_INFO,
+  MSG_NO_LISTEN_PORT,
   MSG_PID_EMPTY,
   MSG_PID_META_MISMATCH,
   MSG_PID_RECORD_EMPTY,
@@ -209,9 +210,9 @@ async def _start_project_process(
   launch_mode_text = MSG_BACK if run_in_background else MSG_FRONT
   selected_port = configured_port or _extract_port_from_command(command)
   conda_context = await detect_conda_context_on_server(server_row)
-  # 按用户要求，后台/部署启动不再把输出重定向到系统 service.log，终端只展示真实执行的 nohup 命令。
+  # 按用户要求，后台/部署启动终端展示 nohup 命令；真实执行时丢弃 stdout/stderr，避免 SSH 等待后台进程输出导致接口卡住。
   visible_command = f'nohup {command} &'
-  launch_command = f'nohup {command} &'
+  launch_command = f'nohup {command} >/dev/null 2>&1 &'
   launch_script = f'''
 cd {shlex.quote(work_dir)}
 {conda_context.init_command}
@@ -238,8 +239,10 @@ if [ -f "$pid_file" ]; then
   fi
   rm -f "$pid_file"
 fi
+set +e
 launch_output="$({launch_shell} 2>&1)"
 launch_status="$?"
+set -e
 echo "$launch_output"
 if [ "$launch_status" -ne 0 ]; then
   echo "{MSG_START_FAIL}：$launch_output"
@@ -250,7 +253,92 @@ if [ -z "$new_pid" ]; then
   echo "{MSG_START_FAIL}：{MSG_PID_EMPTY}"
   exit 12
 fi
-sleep 2
+launch_pid="$new_pid"
+work_dir_resolved="$(readlink -f {shlex.quote(work_dir)} 2>/dev/null || printf '%s\n' {shlex.quote(work_dir)})"
+_detect_listen_pid_by_port() {{
+  [ -n "$PORT_SELECTED" ] || return 0
+  ss -lntpH 2>/dev/null | awk -v p="$PORT_SELECTED" '$4 ~ ":"p"$" {{print}}' | while IFS= read -r item; do
+    for item_pid in $(echo "$item" | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u); do
+      [ -n "$item_pid" ] || continue
+      [ -d "/proc/$item_pid" ] || continue
+      item_cwd="$(readlink -f "/proc/$item_pid/cwd" 2>/dev/null || true)"
+      case "$item_cwd" in
+        "$work_dir_resolved"|"$work_dir_resolved"/*)
+          printf '%s\n' "$item_pid"
+          exit 0
+          ;;
+      esac
+    done
+  done | head -n 1
+}}
+_detect_listen_pair_by_cwd() {{
+  ss -lntpH 2>/dev/null | while IFS= read -r item; do
+    item_port="$(echo "$item" | awk '{{print $4}}' | awk -F: '{{print $NF}}' | grep -E '^[0-9]+$' | head -n 1)"
+    for item_pid in $(echo "$item" | grep -o 'pid=[0-9]*' | cut -d= -f2 | sort -u); do
+      [ -n "$item_pid" ] || continue
+      [ -d "/proc/$item_pid" ] || continue
+      item_cwd="$(readlink -f "/proc/$item_pid/cwd" 2>/dev/null || true)"
+      case "$item_cwd" in
+        "$work_dir_resolved"|"$work_dir_resolved"/*)
+          printf '%s|%s\n' "$item_pid" "$item_port"
+          exit 0
+          ;;
+      esac
+    done
+  done | head -n 1
+}}
+_detected_pid=""
+_detected_port=""
+for _i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  if [ -n "$PORT_SELECTED" ]; then
+    _detected_pid="$(_detect_listen_pid_by_port || true)"
+    if [ -n "$_detected_pid" ]; then
+      _detected_port="$PORT_SELECTED"
+      break
+    fi
+  fi
+  if [ -z "$_detected_pid" ]; then
+    _pair="$(_detect_listen_pair_by_cwd || true)"
+    if [ -n "$_pair" ]; then
+      _detected_pid="$(echo "$_pair" | awk -F'|' '{{print $1}}')"
+      _detected_port="$(echo "$_pair" | awk -F'|' '{{print $2}}')"
+      break
+    fi
+  fi
+  if ! kill -0 "$launch_pid" 2>/dev/null && [ -z "$PORT_SELECTED" ]; then
+    _pair="$(_detect_listen_pair_by_cwd || true)"
+    if [ -n "$_pair" ]; then
+      _detected_pid="$(echo "$_pair" | awk -F'|' '{{print $1}}')"
+      _detected_port="$(echo "$_pair" | awk -F'|' '{{print $2}}')"
+    fi
+    break
+  fi
+  sleep 1
+done
+if [ -n "$_detected_pid" ]; then
+  new_pid="$_detected_pid"
+  if [ -z "$PORT_SELECTED" ] && [ -n "$_detected_port" ]; then
+    PORT_SELECTED="$_detected_port"
+  fi
+elif [ -n "$PORT_SELECTED" ]; then
+  echo "{MSG_START_FAIL}：端口未监听"
+  echo "PSPM_LOG_BEGIN"
+  tail -n 80 "$log_file" 2>/dev/null || true
+  echo "PSPM_LOG_END"
+  exit 13
+elif kill -0 "$launch_pid" 2>/dev/null; then
+  echo "{MSG_START_FAIL}：{MSG_NO_LISTEN_PORT}"
+  echo "PSPM_LOG_BEGIN"
+  tail -n 80 "$log_file" 2>/dev/null || true
+  echo "PSPM_LOG_END"
+  exit 13
+else
+  echo "{MSG_START_FAIL}：{MSG_PROCESS_DEAD}"
+  echo "PSPM_LOG_BEGIN"
+  tail -n 80 "$log_file" 2>/dev/null || true
+  echo "PSPM_LOG_END"
+  exit 13
+fi
 if ! kill -0 "$new_pid" 2>/dev/null; then
   echo "{MSG_START_FAIL}：{MSG_PROCESS_DEAD}"
   echo "PSPM_LOG_BEGIN"
@@ -262,29 +350,6 @@ start_time="$(awk '{{print $22}}' /proc/$new_pid/stat 2>/dev/null || true)"
 if [ -z "$start_time" ]; then
   echo "{MSG_START_FAIL}：{MSG_START_TIME_FAIL}"
   exit 14
-fi
-if [ -z "$PORT_SELECTED" ]; then
-  for _i in 1 2 3 4 5 6 7 8; do
-    detected_line="$(ss -lntpH 2>/dev/null | while IFS= read -r item; do
-      item_pid="$(echo "$item" | grep -o 'pid=[0-9]*' | head -n 1 | cut -d= -f2)"
-      [ "$item_pid" = "$new_pid" ] || continue
-      echo "$item"
-      break
-    done | head -n 1)"
-    if [ -n "$detected_line" ]; then
-      PORT_SELECTED="$(echo "$detected_line" | awk '{{print $4}}' | awk -F: '{{print $NF}}' | grep -E '^[0-9]+$' | head -n 1)"
-      break
-    fi
-    sleep 1
-  done
-fi
-if [ -n "$PORT_SELECTED" ]; then
-  for _i in 1 2 3 4 5; do
-    if ss -lntH 2>/dev/null | awk '{{print $4}}' | grep -E "(^|:)$PORT_SELECTED$" >/dev/null; then
-      break
-    fi
-    sleep 1
-  done
 fi
 echo "$new_pid" > "$pid_file"
 echo "$new_pid|$start_time|{mode}|{now}|$PORT_SELECTED" > "$meta_file"
@@ -303,7 +368,7 @@ echo "{MSG_STARTED.format(mode=launch_mode_text, pid='$new_pid')}"
   if code == 11:
     raise HTTPException(status_code=400, detail=(out or err or MSG_ALREADY_RUNNING).strip())
   if code != 0:
-    detail = (err or out or '未知错误').strip()
+    detail = _strip_internal_runtime_markers(err or out or '未知错误').strip() or '未知错误'
     raise HTTPException(status_code=500, detail=f'{launch_mode_text}{MSG_START_FAIL}：{detail}')
 
   # PSPM_* 标记只供后端解析，返回给前端前会构造成更友好的终端步骤和提示语。

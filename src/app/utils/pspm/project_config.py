@@ -128,8 +128,8 @@ DELETE_SCOPE_OPTIONS = {
   DELETE_SCOPE_PROJECT_CONDA_DB_NGINX,
 }
 
-# 数据库名安全正则：数据库名会进入 SQL DDL，只允许字母、数字、下划线。
-SAFE_IDENTIFIER_RE = re.compile(r'^[a-zA-Z0-9_]+$')
+# 数据库名安全正则：数据库名会进入 SQL DDL，允许字母、数字、下划线和短横线。
+SAFE_IDENTIFIER_RE = re.compile(r'^[a-zA-Z0-9_-]+$')
 
 # Conda 环境名安全正则：环境名会进入 shell 命令，只允许常见安全字符。
 SAFE_ENV_NAME_RE = re.compile(r'^[A-Za-z0-9._-]+$')

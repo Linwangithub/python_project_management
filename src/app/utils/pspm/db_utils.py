@@ -34,10 +34,10 @@ def _safe_db_identifier(name: str) -> str:
   """校验数据库标识符。
 
   参数：
-  - name：数据库名。
+  - name：数据库名，支持短横线，例如 `demo-api`。
 
   作用：
-  - 数据库名会被拼进 CREATE/DROP DATABASE SQL，因此只能允许字母、数字、下划线。
+  - 数据库名会被拼进 CREATE/DROP DATABASE SQL，因此只允许字母、数字、下划线和短横线。
 
   返回：
   - 合法数据库名。
