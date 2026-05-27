@@ -13,7 +13,8 @@ from typing import List, Tuple
 
 from fastapi import HTTPException
 
-from app.utils.pspm.project_config import CONDA_INIT, TERMINAL_HOME_DIR
+from app.utils.pspm.conda_utils import detect_conda_init_on_local
+from app.utils.pspm.project_config import TERMINAL_HOME_DIR
 from app.utils.pspm.terminal_config import terminal_message
 
 # 终端默认根目录。当前系统以 root 管理远端服务器，因此 shell 展示以该路径为 home。
@@ -299,7 +300,11 @@ async def _complete_command_candidates(token: str) -> List[str]:
     if not token:
         return []
 
-    cmd = f"{CONDA_INIT}compgen -c -- {shlex.quote(token)} | sort -u"
+    try:
+        conda_init = await detect_conda_init_on_local()
+    except HTTPException:
+        conda_init = 'true'
+    cmd = f"{conda_init}; compgen -c -- {shlex.quote(token)} | sort -u"
     process = await asyncio.create_subprocess_exec(
         '/bin/bash',
         '-lc',

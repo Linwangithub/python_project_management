@@ -50,8 +50,11 @@ from app.utils.pspm.runtime_helpers import (
   _strip_internal_runtime_markers,
 )
 from app.utils.pspm.runtime_prepare import (
-  _detect_remote_conda_init,
   _ensure_project_runtime_config,
+)
+from app.utils.pspm.conda_utils import (
+  build_conda_context_shell_command,
+  detect_conda_context_on_server,
 )
 from app.utils.pspm.runtime_ready import (
   _check_started_process_ready,
@@ -205,10 +208,18 @@ async def _start_project_process(
   now = int(time.time())
   launch_mode_text = MSG_BACK if run_in_background else MSG_FRONT
   selected_port = configured_port or _extract_port_from_command(command)
-  conda_init = await _detect_remote_conda_init(server_row)
+  conda_context = await detect_conda_context_on_server(server_row)
   # 按用户要求，后台/部署启动不再把输出重定向到系统 service.log，终端只展示真实执行的 nohup 命令。
   visible_command = f'nohup {command} &'
   launch_command = f'nohup {command} &'
+  launch_script = f'''
+cd {shlex.quote(work_dir)}
+{conda_context.init_command}
+conda activate {shlex.quote(conda_name)}
+{launch_command}
+echo "PSPM_LAUNCH_PID=$!"
+'''
+  launch_shell = build_conda_context_shell_command(conda_context, launch_script)
 
   script = f"""
 set -euo pipefail
@@ -227,11 +238,14 @@ if [ -f "$pid_file" ]; then
   fi
   rm -f "$pid_file"
 fi
-cd {shlex.quote(work_dir)}
-{conda_init}
-conda activate {shlex.quote(conda_name)}
-{launch_command}
-new_pid="$!"
+launch_output="$({launch_shell} 2>&1)"
+launch_status="$?"
+echo "$launch_output"
+if [ "$launch_status" -ne 0 ]; then
+  echo "{MSG_START_FAIL}：$launch_output"
+  exit 12
+fi
+new_pid="$(echo "$launch_output" | awk -F= '/^PSPM_LAUNCH_PID=/ {{print $2; exit}}')"
 if [ -z "$new_pid" ]; then
   echo "{MSG_START_FAIL}：{MSG_PID_EMPTY}"
   exit 12

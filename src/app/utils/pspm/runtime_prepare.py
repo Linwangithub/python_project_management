@@ -12,7 +12,7 @@ import shlex
 from fastapi import HTTPException
 
 from app.utils.pspm.path_utils import _normalize_path, _safe_conda_name
-from app.utils.pspm.project_config import CONDA_INIT_CANDIDATE_PATHS
+from app.utils.pspm.conda_utils import detect_conda_init_on_server
 from app.utils.pspm.runtime_helpers import (
   MSG_ENTRY_MISSING,
   _get_raw_start_command,
@@ -24,34 +24,10 @@ from app.utils.pspm.shell_utils import _run_server_shell
 async def _detect_remote_conda_init(server_row) -> str:
   """探测远程服务器可用的 Conda 初始化脚本。
 
-  参数：
-  - server_row：服务器记录，提供 IP、端口、密码等 SSH 连接信息。
-
-  作用：
-  - 项目前台、后台、部署启动前需要激活项目 Conda 环境。
-  - 不同服务器 Conda 安装路径可能不同，因此按配置候选路径逐个检查。
-
-  返回：
-  - 可直接拼接到 shell 中执行的 source 命令。
-  - 如果 conda 已在 PATH 中，则返回 true。
-
-  异常：
-  - 未找到 Conda 初始化方式时抛出 HTTP 400。
+  该函数保留原有入口名称，内部复用统一 Conda 工具，保证启动流程、同步流程和设置流程
+  使用同一份候选路径配置。
   """
-  candidates = CONDA_INIT_CANDIDATE_PATHS
-  checks = ' '.join(f'{shlex.quote(path)}' for path in candidates)
-  command = (
-    'for p in ' + checks + '; do '
-    'if [ -f "$p" ]; then echo "$p"; exit 0; fi; '
-    'done; '
-    'command -v conda >/dev/null 2>&1 && echo "" && exit 0; '
-    'exit 1'
-  )
-  code, out, _err = await _run_server_shell(server_row, command, timeout=15)
-  if code != 0:
-    raise HTTPException(status_code=400, detail='未找到Conda初始化脚本，无法激活项目Conda环境')
-  path = (out or '').strip().splitlines()[0].strip() if (out or '').strip() else ''
-  return f'source {shlex.quote(path)} >/dev/null 2>&1 || true' if path else 'true'
+  return await detect_conda_init_on_server(server_row)
 
 
 async def _ensure_remote_file_exists(server_row, abs_path: str, display_path: str) -> None:

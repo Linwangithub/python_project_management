@@ -17,7 +17,7 @@ from app.services.pspm.project_checks import (
   list_project_conda_envs_service,
   list_project_entry_path_children_service,
 )
-from app.services.pspm.project_health import inspect_project_health_service
+from app.services.pspm.project_health import inspect_project_health_service, inspect_project_service_status_service
 from app.services.pspm.project_detail import get_project_detail_service, list_project_logs_service
 
 @router.get('/entry-path-children', name='入口文件路径子项', response_model=schemas.pspm.ProjectEntryPathChildrenResponse)
@@ -68,6 +68,32 @@ async def check_project_health(
   - ProjectHealthCheckResponse，data 为带检测结果的项目行结构。
   """
   data = await inspect_project_health_service(session, current_user, project_id)
+  return schemas.pspm.ProjectHealthCheckResponse(data=data)
+
+
+
+@router.get('/service-status', name='项目服务状态检测', response_model=schemas.pspm.ProjectHealthCheckResponse)
+async def check_project_service_status(
+  *,
+  session: SessionDep,
+  current_user=Depends(require_permission('project_management', None)),
+  project_id: int = Query(..., description='项目ID'),
+):
+  """轻量检测单个项目服务状态。
+
+  参数：
+  - session：数据库会话。
+  - current_user：当前登录用户，只要求项目管理菜单可见。
+  - project_id：项目 ID，来自服务状态列按钮。
+
+  作用：
+  - 仅检测项目运行进程和监听端口，不执行目录、Conda、数据库、Nginx 等完整健康检测。
+  - 用于项目列表“服务状态”按钮，避免点击服务状态时接口被完整项目检测拖到超时。
+
+  返回：
+  - ProjectHealthCheckResponse，data 中包含 service_status 和 running_port。
+  """
+  data = await inspect_project_service_status_service(session, current_user, project_id)
   return schemas.pspm.ProjectHealthCheckResponse(data=data)
 
 

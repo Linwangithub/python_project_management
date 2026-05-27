@@ -16,7 +16,7 @@ from sqlalchemy import select
 from app import models, schemas
 from app.crud.pspm import project_status_to_name
 from app.services.pspm.project_helpers import get_project_for_user, parse_conda_envs_dir
-from app.utils.pspm.project_config import CONDA_INIT
+from app.utils.pspm.conda_utils import run_conda_command_on_server
 from app.utils.pspm.project_detail_config import (
     CHANGE_FIELD_LABELS,
     PROJECT_DETAIL_ALWAYS_SHOW_FIELDS,
@@ -235,7 +235,7 @@ async def _query_conda_detail(server_row, conda_env_name: str, stored_python_ver
         return '', stored_python_version
 
     env_path = ''
-    code, out, _err = await _run_server_shell(server_row, f'{CONDA_INIT}; conda env list --json', timeout=120)
+    code, out, _err = await run_conda_command_on_server(server_row, 'conda env list --json', timeout=120)
     if code == 0:
         try:
             data = json.loads(out or '{}')
@@ -250,16 +250,16 @@ async def _query_conda_detail(server_row, conda_env_name: str, stored_python_ver
             env_path = ''
 
     if not env_path:
-        code_info, out_info, _err_info = await _run_server_shell(server_row, f'{CONDA_INIT}; conda info', timeout=120)
+        code_info, out_info, _err_info = await run_conda_command_on_server(server_row, 'conda info', timeout=120)
         if code_info == 0:
             envs_dir = parse_conda_envs_dir(out_info)
             if envs_dir:
                 env_path = f'{envs_dir.rstrip("/")}/{env_name}'
 
     python_version = stored_python_version
-    code_py, out_py, err_py = await _run_server_shell(
+    code_py, out_py, err_py = await run_conda_command_on_server(
         server_row,
-        f'{CONDA_INIT}; conda run -n {shlex.quote(env_name)} python --version',
+        f'conda run -n {shlex.quote(env_name)} python --version',
         timeout=120,
     )
     if code_py == 0:

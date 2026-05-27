@@ -49,6 +49,7 @@ CONDA_INIT_CANDIDATE_PATHS = [
   '/opt/miniforge3/etc/profile.d/conda.sh',
   '/opt/miniconda3/etc/profile.d/conda.sh',
   '/opt/anaconda3/etc/profile.d/conda.sh',
+  '/home/wcp/project_data/miniforge3/etc/profile.d/conda.sh',
 ]
 
 # 公共前端打包资源根目录；Nginx root 默认使用该目录，避免访问 /root 权限受限。
@@ -56,6 +57,9 @@ FRONTEND_DIST_BASE_DIR = '/data/frontend_dist'
 
 # root 用户项目目录前缀。
 ROOT_PROJECT_BASE_DIR = '/root/project'
+
+# root 用户同步已有项目时的起始浏览目录；root 可从系统根目录逐层选择已有项目。
+ROOT_SYNC_BASE_DIR = '/'
 
 # 普通用户项目目录模板；{username} 会在接口返回用户信息时替换为真实用户名。
 USER_PROJECT_BASE_PATH_TEMPLATE = '/home/{username}/project'

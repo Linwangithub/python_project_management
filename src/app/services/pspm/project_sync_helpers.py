@@ -11,7 +11,7 @@ import os
 from fastapi import HTTPException
 
 from app.utils.pspm.path_utils import _normalize_path, _safe_rel_path_input
-from app.utils.pspm.project_config import TERMINAL_HOME_DIR, USER_HOME_BASE_PATH_TEMPLATE
+from app.utils.pspm.project_config import ROOT_SYNC_BASE_DIR, USER_HOME_BASE_PATH_TEMPLATE
 from app.utils.pspm.shell_utils import _split_lines
 
 
@@ -31,7 +31,7 @@ def _project_base_path_for_user(current_user, is_root: bool) -> str:
   """
   username = str(getattr(current_user, 'username', '') or 'user').strip() or 'user'
   if is_root:
-    return TERMINAL_HOME_DIR
+    return ROOT_SYNC_BASE_DIR
   return _normalize_path(USER_HOME_BASE_PATH_TEMPLATE.replace('{username}', username))
 
 def _clean_python_version_output(text: str) -> str:
@@ -72,6 +72,9 @@ def _safe_sync_abs_path(base_path: str, rel_path: str) -> str:
   if not rel:
     return base
   target = os.path.normpath(os.path.join(base, rel))
+  # 当 root 用户的同步起点是系统根目录 `/` 时，`/root`、`/home` 等目录都属于允许范围。
+  if base == '/':
+    return target
   if target != base and not target.startswith(f'{base}/'):
     raise HTTPException(status_code=400, detail='项目目录越界')
   return target
@@ -82,7 +85,8 @@ def _safe_sync_backend_path(base_path: str, backend_path: str) -> str:
   target = _normalize_path(backend_path)
   if target == base:
     raise HTTPException(status_code=400, detail='请选择具体项目目录，不能选择项目根目录')
-  if not target.startswith(f'{base}/'):
+  # root 用户从 `/` 开始选择时，任意绝对路径都位于允许起点下；普通用户仍限制在 `/home/用户名` 下。
+  if base != '/' and not target.startswith(f'{base}/'):
     raise HTTPException(status_code=400, detail=f'项目目录必须位于 {base} 下')
   return target
 

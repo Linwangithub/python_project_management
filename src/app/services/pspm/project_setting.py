@@ -52,7 +52,7 @@ from app.utils.pspm.path_utils import (
   _safe_port_number,
   _safe_python_version,
 )
-from app.utils.pspm.project_config import CONDA_INIT
+from app.utils.pspm.conda_utils import run_conda_command_on_server
 from app.utils.pspm.shell_utils import (
   _find_project_nginx_server_row,
   _find_server_row_by_id,
@@ -81,15 +81,15 @@ async def apply_conda_setting_change(project, project_server_row, data_in: dict,
     env_names = await list_conda_env_names_on_server(project_server_row)
     if new_conda_name in env_names:
       raise HTTPException(status_code=400, detail=f'Conda环境已存在：{new_conda_name}')
-    conda_create_cmd = f'{CONDA_INIT}; conda create -n {shlex.quote(new_conda_name)} python={shlex.quote(python_version)} -y'
-    code, out, err = await _run_server_shell(project_server_row, conda_create_cmd, timeout=3600)
+    conda_create_cmd = f'conda create -n {shlex.quote(new_conda_name)} python={shlex.quote(python_version)} -y'
+    code, out, err = await run_conda_command_on_server(project_server_row, conda_create_cmd, timeout=3600)
     if code != 0:
       raise HTTPException(status_code=500, detail=f'创建Conda环境失败：{err.strip() or out.strip() or '未知错误'}')
     actions.append(f'创建Conda环境：{new_conda_name}，Python版本：{python_version}')
 
   if drop_original_conda_env and original_conda_name and conda_changed:
-    conda_remove_cmd = f'{CONDA_INIT}; conda env remove -n {shlex.quote(original_conda_name)} -y'
-    code, out, err = await _run_server_shell(project_server_row, conda_remove_cmd, timeout=3600)
+    conda_remove_cmd = f'conda env remove -n {shlex.quote(original_conda_name)} -y'
+    code, out, err = await run_conda_command_on_server(project_server_row, conda_remove_cmd, timeout=3600)
     if code != 0:
       raise HTTPException(status_code=500, detail=f'删除原Conda环境失败：{original_conda_name} {err.strip() or out.strip() or '未知错误'}'.strip())
     actions.append(f'删除原Conda环境：{original_conda_name}')

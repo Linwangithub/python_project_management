@@ -41,7 +41,7 @@ from app.utils.pspm.path_utils import (
   _safe_project_name,
   _safe_rel_path_input,
 )
-from app.utils.pspm.project_config import CONDA_INIT
+from app.utils.pspm.conda_utils import run_conda_command_on_server
 from app.utils.pspm.shell_utils import (
   _find_server_row_by_id,
   _find_server_row_by_ip,
@@ -119,7 +119,7 @@ async def list_project_conda_envs_service(session, current_user, project_id: int
   if not server_row:
     raise HTTPException(status_code=403, detail='当前用户无该项目服务器使用权限')
 
-  code, out, err = await _run_server_shell(server_row, f'{CONDA_INIT}; conda info', timeout=120)
+  code, out, err = await run_conda_command_on_server(server_row, 'conda info', timeout=120)
   if code != 0:
     raise HTTPException(status_code=500, detail=f'查询Conda信息失败：{err.strip() or out.strip() or '未知错误'}')
 
@@ -127,7 +127,7 @@ async def list_project_conda_envs_service(session, current_user, project_id: int
   if not envs_dir:
     raise HTTPException(status_code=500, detail='未解析到Conda环境目录')
 
-  envs = await list_conda_env_names_on_server(server_row)
+  envs = await list_conda_env_names_on_server(server_row, envs_dir=envs_dir)
   return schemas.pspm.ProjectCondaEnvListData(envs_dir=envs_dir, envs=envs)
 
 

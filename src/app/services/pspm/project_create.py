@@ -41,7 +41,8 @@ from app.utils.pspm.path_utils import (
   _build_target_dir,
   _safe_optional_port_text,
 )
-from app.utils.pspm.project_config import CONDA_INIT, DEFAULT_FRONTEND_PATH
+from app.utils.pspm.conda_utils import run_conda_command_local
+from app.utils.pspm.project_config import DEFAULT_FRONTEND_PATH
 from app.utils.pspm.project_create_messages import (
   NGINX_PORT_REQUIRED_MESSAGE,
   NGINX_PORT_SAME_MESSAGE,
@@ -194,8 +195,8 @@ async def create_project_real_service(session, current_user, payload: schemas.ps
   if os.path.exists(target_dir):
     raise HTTPException(status_code=400, detail=render_project_create_message('directory_exists', path=target_dir))
 
-  conda_list_cmd = f'{CONDA_INIT}; conda env list --json'
-  code, out, err = await _run_shell(conda_list_cmd, timeout=120)
+  conda_list_cmd = 'conda env list --json'
+  code, out, err = await run_conda_command_local(conda_list_cmd, timeout=120)
   if code != 0:
     msg = err.strip() or out.strip() or UNKNOWN_ERROR_MESSAGE
     raise HTTPException(status_code=500, detail=render_project_create_message('conda_query_failed', message=msg))
@@ -252,9 +253,9 @@ async def create_project_real_service(session, current_user, payload: schemas.ps
 
   mkdir_cmd = f'mkdir -p {shlex.quote(target_dir)}'
   mkdir_frontend_dist_cmd = f'mkdir -p {shlex.quote(frontend_dist_base_dir)}'
-  conda_cmd = f'{CONDA_INIT}; conda create -n {shlex.quote(conda_name)} python={shlex.quote(python_version)} -y'
-  py_ver_cmd = f'{CONDA_INIT}; conda run -n {shlex.quote(conda_name)} python --version'
-  conda_remove_cmd = f'{CONDA_INIT}; conda env remove -n {shlex.quote(conda_name)} -y'
+  conda_cmd = f'conda create -n {shlex.quote(conda_name)} python={shlex.quote(python_version)} -y'
+  py_ver_cmd = f'conda run -n {shlex.quote(conda_name)} python --version'
+  conda_remove_cmd = f'conda env remove -n {shlex.quote(conda_name)} -y'
   rm_dir_cmd = f'rm -rf {shlex.quote(target_dir)}'
 
   async def rollback_all() -> List[str]:
@@ -302,7 +303,7 @@ async def create_project_real_service(session, current_user, payload: schemas.ps
 
     if conda_created:
       logs.append(f'$ conda env remove -n {conda_name} -y')
-      code_rb, out_rb, err_rb = await _run_shell(conda_remove_cmd, timeout=3600)
+      code_rb, out_rb, err_rb = await run_conda_command_local(conda_remove_cmd, timeout=3600)
       logs.extend(_split_lines(out_rb))
       logs.extend(_split_lines(err_rb))
       if code_rb != 0:
@@ -346,7 +347,7 @@ async def create_project_real_service(session, current_user, payload: schemas.ps
       logs.append(render_project_create_message('create_frontend_dir_success', path=frontend_dist_base_dir))
 
     logs.append(render_project_create_message('create_conda_start', conda_name=conda_name, python_version=python_version))
-    code, out, err = await _run_shell(conda_cmd, timeout=3600)
+    code, out, err = await run_conda_command_local(conda_cmd, timeout=3600)
     if code != 0:
       actions.append(render_project_create_message('create_conda_failed_action', conda_name=conda_name, python_version=python_version))
       raise HTTPException(status_code=500, detail=render_project_create_message('create_conda_failed', message=err.strip() or UNKNOWN_ERROR_MESSAGE))
@@ -355,7 +356,7 @@ async def create_project_real_service(session, current_user, payload: schemas.ps
     logs.append(render_project_create_message('create_conda_success', conda_name=conda_name, python_version=python_version))
 
     logs.append(render_project_create_message('check_python_start', conda_name=conda_name))
-    code, out, err = await _run_shell(py_ver_cmd, timeout=120)
+    code, out, err = await run_conda_command_local(py_ver_cmd, timeout=120)
     if code != 0:
       actions.append(render_project_create_message('check_python_failed_action', conda_name=conda_name))
       raise HTTPException(status_code=500, detail=render_project_create_message('check_python_failed', message=err.strip() or UNKNOWN_ERROR_MESSAGE))

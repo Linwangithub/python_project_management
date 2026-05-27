@@ -35,7 +35,7 @@ from app.utils.pspm.terminal_config import (
     WS_RESPONSE_OUTPUT,
     terminal_message,
 )
-from app.utils.pspm.terminal_shell import _build_terminal_process_command
+from app.utils.pspm.terminal_shell import _build_terminal_process_command, _get_terminal_default_cwd
 from app.utils.pspm.terminal_ws_helpers import _extract_ws_marked_value, _safe_send_json, _terminal_ws_response
 
 # WebSocket 终端默认 home 目录。
@@ -247,6 +247,7 @@ async def _create_ws_terminal_session(current_user: schemas.users.Data, server_i
     """
     server_row = await _get_ws_allowed_server_by_ip(current_user, server_ip)
     command = await _build_terminal_process_command(server_row)
+    initial_cwd = await _get_terminal_default_cwd(server_row)
     master_fd, slave_fd = pty.openpty()
     process: subprocess.Popen | None = None
     try:
@@ -284,7 +285,7 @@ async def _create_ws_terminal_session(current_user: schemas.users.Data, server_i
         'output_buffer': [],
         'reader_task': None,
         'alive': True,
-        'cwd': HOME_DIR,
+        'cwd': initial_cwd,
         'conda_env_name': 'base',
         'foreground_project_id': 0,
         'foreground_pid': '',

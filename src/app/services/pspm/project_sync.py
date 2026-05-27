@@ -44,7 +44,7 @@ from app.utils.pspm.path_utils import (
   _safe_project_name,
   _safe_rel_path_input,
 )
-from app.utils.pspm.project_config import CONDA_INIT
+from app.utils.pspm.conda_utils import run_conda_command_on_server, run_shell_in_conda_context_on_server
 from app.utils.pspm.shell_utils import (
   _run_server_shell,
   _split_lines,
@@ -53,12 +53,22 @@ from app.utils.pspm.shell_utils import (
 
 
 async def _list_directory_children(server_row, path: str) -> list[str]:
-  """列出指定服务器目录下的一层子目录名称。"""
-  command = f'if [ -d {shlex.quote(path)} ]; then find {shlex.quote(path)} -mindepth 1 -maxdepth 1 -type d ! -name ".*" -printf "%f\\n" | sort; fi'
+  """列出指定服务器目录下的一层子目录名称。
+
+  这个函数同时完成目录存在性检测和目录子项读取，避免同步项目弹框每展开一层目录都执行
+  `test -d` 和 `find` 两次服务器命令，从而降低接口超时概率。
+  """
+  safe_path = shlex.quote(path)
+  command = (
+    f'if [ ! -d {safe_path} ]; then echo "__PSPM_DIR_NOT_FOUND__"; exit 2; fi; '
+    f'find {safe_path} -mindepth 1 -maxdepth 1 -type d ! -name ".*" -printf "%f\\n" | sort'
+  )
   code, out, err = await _run_server_shell(server_row, command, timeout=60)
+  if code == 2:
+    raise HTTPException(status_code=400, detail=f'项目目录不存在：{path}')
   if code != 0:
     raise HTTPException(status_code=500, detail=f'读取项目目录失败：{err.strip() or out.strip() or '未知错误'}')
-  return [x.strip() for x in _split_lines(out) if x.strip()]
+  return [x.strip() for x in _split_lines(out) if x.strip() and x.strip() != '__PSPM_DIR_NOT_FOUND__']
 
 
 async def _list_entry_children(server_row, path: str, rel_dir: str) -> list[schemas.pspm.ProjectEntryPathNode]:
@@ -103,9 +113,13 @@ async def _list_entry_children(server_row, path: str, rel_dir: str) -> list[sche
 
 
 async def _query_conda_env_detail(server_row, env_name: str) -> tuple[str, str]:
-  """查询指定 Conda 环境的实际路径和 Python 版本。"""
+  """查询指定 Conda 环境的实际路径和 Python 版本。
+
+  该函数复用同一次 Conda 初始化探测结果，并优先直接执行环境目录下的
+  `bin/python --version`，避免 `conda run` 在部分 GPU 服务器上响应过慢。
+  """
   name = _safe_conda_name(env_name)
-  code, out, err = await _run_server_shell(server_row, f'{CONDA_INIT}; conda info', timeout=120)
+  code, out, err = await run_conda_command_on_server(server_row, 'conda info', timeout=120)
   if code != 0:
     raise HTTPException(status_code=500, detail=f'查询Conda信息失败：{err.strip() or out.strip() or '未知错误'}')
 
@@ -113,16 +127,21 @@ async def _query_conda_env_detail(server_row, env_name: str) -> tuple[str, str]:
   if not envs_dir:
     raise HTTPException(status_code=500, detail='未解析到Conda环境目录')
 
-  envs = await list_conda_env_names_on_server(server_row)
-  if name not in envs:
-    raise HTTPException(status_code=400, detail=f'Conda环境不存在：{name}')
-
   env_path = f'{envs_dir.rstrip("/")}/{name}'
-  code_py, out_py, err_py = await _run_server_shell(
+  safe_env_path = shlex.quote(env_path)
+  safe_python_bin = shlex.quote(f'{env_path}/bin/python')
+  code_py, out_py, err_py = await run_shell_in_conda_context_on_server(
     server_row,
-    f'{CONDA_INIT}; conda run -n {shlex.quote(name)} python --version',
+    (
+      f'if [ ! -d {safe_env_path} ]; then exit 3; fi; '
+      f'if [ -x {safe_python_bin} ]; then {safe_python_bin} --version; '
+      f'else conda run -n {shlex.quote(name)} python --version; fi'
+    ),
     timeout=120,
+    include_conda_init=True,
   )
+  if code_py == 3:
+    raise HTTPException(status_code=400, detail=f'Conda环境不存在：{name}')
   if code_py != 0:
     raise HTTPException(status_code=400, detail=f'Conda环境不可用：{err_py.strip() or out_py.strip() or "无法获取Python版本"}')
   python_version = _clean_python_version_output('\n'.join(_split_lines(out_py) + _split_lines(err_py)))
@@ -136,9 +155,6 @@ async def list_sync_project_path_children_service(session, current_user, payload
   is_root = await crud.rbac.is_root_user(session, user_id=current_user.id)
   base_path = _project_base_path_for_user(current_user, is_root)
   target_dir = _safe_sync_abs_path(base_path, payload.rel_path)
-  if not await _server_directory_exists(server_row, target_dir):
-    raise HTTPException(status_code=400, detail=f'项目目录不存在：{target_dir}')
-
   nodes: list[schemas.pspm.ProjectSyncPathNode] = []
   for name in await _list_directory_children(server_row, target_dir):
     rel = name if not str(payload.rel_path or '').strip() else f'{_safe_rel_path_input(payload.rel_path)}/{name}'
@@ -178,13 +194,13 @@ async def list_sync_entry_path_children_service(session, current_user, payload: 
 async def list_sync_conda_envs_service(session, current_user, payload: schemas.pspm.ProjectSyncCondaEnvListRequest):
   """查询同步已有项目可选择的 Conda 环境列表。"""
   _servers, server_row = await _get_allowed_server_by_ip(session, current_user, payload.server_ip)
-  code, out, err = await _run_server_shell(server_row, f'{CONDA_INIT}; conda info', timeout=120)
+  code, out, err = await run_conda_command_on_server(server_row, 'conda info', timeout=120)
   if code != 0:
     raise HTTPException(status_code=500, detail=f'查询Conda信息失败：{err.strip() or out.strip() or '未知错误'}')
   envs_dir = parse_conda_envs_dir(out)
   if not envs_dir:
     raise HTTPException(status_code=500, detail='未解析到Conda环境目录')
-  envs = await list_conda_env_names_on_server(server_row)
+  envs = await list_conda_env_names_on_server(server_row, envs_dir=envs_dir)
   return schemas.pspm.ProjectSyncCondaEnvListData(envs_dir=envs_dir, envs=envs)
 
 

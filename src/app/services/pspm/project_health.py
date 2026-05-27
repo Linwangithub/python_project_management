@@ -254,6 +254,43 @@ def _project_schema_from_orm(project, owner_name: str = '', server_ip: str | Non
   item.running_port = ''
   return item
 
+async def inspect_project_service_status_service(session, current_user, project_id: int) -> schemas.pspm.ProjectItem:
+  """轻量检测单个项目服务运行状态。
+
+  参数：
+  - session：数据库会话。
+  - current_user：当前登录用户。
+  - project_id：前端点击“服务状态”按钮时传入的项目 ID。
+
+  作用：
+  - 只读取 runtime pid/meta 并检测进程与监听端口。
+  - 不检查项目目录、Conda、数据库或 Nginx，避免服务状态按钮被完整健康检测拖慢。
+  - 检测完成后同步更新项目运行状态，保证列表中的服务状态和运行端口一致。
+
+  返回：
+  - ProjectItem：与列表行同结构，只更新 service_status、running_port 和 status。
+  """
+  project, _is_root = await get_project_for_user(session, project_id, current_user)
+  servers = await _list_allowed_server_rows(session, current_user)
+  server_by_id = {int(getattr(item, 'id', 0) or 0): item for item in servers.data}
+  server_row = server_by_id.get(int(getattr(project, 'server_id', None) or 0))
+  server_ip = str(getattr(server_row, 'ip', '') or '').strip() if server_row else ''
+
+  item = _project_schema_from_orm(project, owner_name=str(getattr(current_user, 'username', '') or ''), server_ip=server_ip or None)
+  if not server_row:
+    item.service_status = HEALTH_SERVICE_STOPPED
+    item.running_port = ''
+  else:
+    runtime_data = await _inspect_project_runtime(server_row, item)
+    item.service_status, item.running_port = _normalize_service_runtime(runtime_data)
+
+  await crud.projects.update_status(session, project_id=project_id, running=item.service_status == HEALTH_SERVICE_RUNNING)
+  item.status = item.service_status
+  item.project_status = HEALTH_STATUS_UNCHECKED
+  item.project_status_detail = ''
+  return item
+
+
 async def inspect_project_health_service(session, current_user, project_id: int) -> schemas.pspm.ProjectItem:
   """按需检测单个项目的健康状态。
 

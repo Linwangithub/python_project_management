@@ -10,7 +10,8 @@ from fastapi import HTTPException
 
 from app import crud, schemas
 from app.utils.pspm.path_utils import _safe_conda_name
-from app.utils.pspm.project_config import CONDA_INIT, FORBIDDEN_PROJECT_DELETE_PATHS, FRONTEND_DIST_BASE_DIR
+from app.utils.pspm.conda_utils import run_conda_command_on_server
+from app.utils.pspm.project_config import FORBIDDEN_PROJECT_DELETE_PATHS, FRONTEND_DIST_BASE_DIR
 from app.utils.pspm.shell_utils import _run_server_shell, _split_lines
 
 
@@ -117,7 +118,7 @@ def parse_conda_envs_dir(conda_info_text: str) -> str:
   return ''
 
 
-async def list_conda_env_names_on_server(server_row) -> list[str]:
+async def list_conda_env_names_on_server(server_row, envs_dir: str | None = None) -> list[str]:
   """查询某台服务器上的 Conda 环境名称列表。
 
   参数：
@@ -134,13 +135,14 @@ async def list_conda_env_names_on_server(server_row) -> list[str]:
   异常：
   - 查询失败、解析失败、列目录失败时抛出 HTTP 500。
   """
-  code, out, err = await _run_server_shell(server_row, f'{CONDA_INIT}; conda info', timeout=120)
-  if code != 0:
-    raise HTTPException(status_code=500, detail=f'查询Conda信息失败：{err.strip() or out.strip() or '未知错误'}')
-
-  envs_dir = parse_conda_envs_dir(out)
   if not envs_dir:
-    raise HTTPException(status_code=500, detail='未解析到Conda环境目录')
+    code, out, err = await run_conda_command_on_server(server_row, 'conda info', timeout=120)
+    if code != 0:
+      raise HTTPException(status_code=500, detail=f'查询Conda信息失败：{err.strip() or out.strip() or '未知错误'}')
+
+    envs_dir = parse_conda_envs_dir(out)
+    if not envs_dir:
+      raise HTTPException(status_code=500, detail='未解析到Conda环境目录')
 
   safe_envs_dir = shlex.quote(envs_dir)
   code_ls, out_ls, err_ls = await _run_server_shell(

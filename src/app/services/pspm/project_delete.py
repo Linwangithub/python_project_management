@@ -17,8 +17,8 @@ from app.utils.pspm.nginx_utils import (
   _is_nginx_running_on_server,
 )
 from app.utils.pspm.nginx_server_blocks import _remove_project_server_blocks
+from app.utils.pspm.conda_utils import run_conda_command_local
 from app.utils.pspm.project_config import (
-  CONDA_INIT,
   DEFAULT_MYSQL_HOST,
   DEFAULT_MYSQL_PORT,
   DELETE_SCOPE_OPTIONS,
@@ -105,8 +105,8 @@ async def delete_conda_envs_if_needed(project_rows, delete_scope: str):
     conda_name = (row.conda_env_name or '').strip()
     if not conda_name:
       continue
-    cmd = f'{CONDA_INIT}; conda env remove -n {shlex.quote(conda_name)} -y'
-    code, _out, err = await _run_shell(cmd, timeout=3600)
+    cmd = f'conda env remove -n {shlex.quote(conda_name)} -y'
+    code, _out, err = await run_conda_command_local(cmd, timeout=3600)
     if code != 0:
       raise HTTPException(status_code=500, detail=f'删除Conda环境失败：{conda_name} {err.strip() or ""}'.strip())
 
